@@ -1,0 +1,154 @@
+UseValidation.py
+from Validation import load_validation_rules, validate_form
+
+VALIDATION_RULES = load_validation_rules()
+
+@app.route('/validate', methods=['POST'])
+def validate():
+    data = request.form
+    errors = validate_form(data, VALIDATION_RULES, {
+        'username': lambda v: not User.query.filter_by(username=v).first()
+    })
+    if errors:
+        return render_template('index.html', errors=errors, old=data)
+
+    # 問題なければ保存処理
+    user = User(username=data['username'], gender=data['gender'])
+    db.session.add(user)
+    db.session.commit()
+    return redirect(url_for('complete'))
+Validation.py
+import json, re
+
+def load_validation_rules(path='validation_rules.json'):
+    with open(path, encoding='utf-8') as f:
+        return json.load(f)
+
+def validate_form(form_data, rules, unique_check_funcs=None):
+    errors, indexed_fields = {}, {}
+    for k, v in form_data.items():
+        m = re.match(r'^(\w+)\[(\d+)\]$', k)
+        field, idx = m.groups() if m else (k, 'single')
+        indexed_fields.setdefault(idx, {})[field] = v
+
+    unique_fields = [f for f, r in rules.items() if r.get('uniqueInForm')]
+    for f in unique_fields:
+        vals = [flds[f] for flds in indexed_fields.values() if f in flds]
+        dups = {x for x in vals if vals.count(x) > 1}
+        for idx, flds in indexed_fields.items():
+            if flds.get(f) in dups:
+                errors[f"{f}[{idx}]"] = rules[f]['messages']['duplicate']
+
+    for idx, flds in indexed_fields.items():
+        for f, v in flds.items():
+            if f"{f}[{idx}]" in errors: continue
+            rule = rules.get(f)
+            if not rule: continue
+
+            if rule.get('required') and not v:
+                errors[f"{f}[{idx}]"] = rule['messages']['required']
+            elif 'pattern' in rule and not re.match(rule['pattern'], v):
+                errors[f"{f}[{idx}]"] = rule['messages']['pattern']
+            elif 'minLength' in rule and len(v) < rule['minLength']:
+                errors[f"{f}[{idx}]"] = rule['messages']['minLength']
+            elif 'maxLength' in rule and len(v) > rule['maxLength']:
+                errors[f"{f}[{idx}]"] = rule['messages']['maxLength']
+            elif 'choices' in rule and v not in rule['choices']:
+                errors[f"{f}[{idx}]"] = rule['messages']['choices']
+            elif unique_check_funcs and f in unique_check_funcs and not unique_check_funcs[f](v):
+                errors[f"{f}[{idx}]"] = rule['messages']['unique']
+
+    return errors
+UseValidation.js
+import { loadValidationRules, validateForm, showErrors } from './Validation.js';
+
+export async function handleFormValidation(formId) {
+  const rules = await loadValidationRules();
+  const formData = new FormData(document.getElementById(formId));
+  const errors = await validateForm(formData, rules);
+  showErrors(errors, rules);
+  return !Object.keys(errors).length;
+}
+Validation.js
+export async function loadValidationRules(url = '/static/validation_rules.json') {
+  const res = await fetch(url);
+  return await res.json();
+}
+
+function findDuplicates(values) {
+  const seen = {};
+  const duplicates = new Set();
+  values.forEach(v => seen[v] ? duplicates.add(v) : seen[v] = true);
+  return duplicates;
+}
+
+async function checkRemote(field, value, rule) {
+  if (!rule.remote) return { valid: true };
+  const res = await fetch(rule.remote.url, {
+    method: rule.remote.method,
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[field]: value})
+  });
+  if (res.ok) return { valid: true };
+  return { valid: false, error: (await res.json()).message };
+}
+
+export async function validateForm(formData, rules) {
+  const errors = {}, indexedFields = {};
+
+  for (const [name, val] of formData.entries()) {
+    const m = name.match(/^(\w+)\[(\d+)\]$/);
+    const [field, idx] = m ? [m[1], m[2]] : [name, 'single'];
+    (indexedFields[idx] ||= {})[field] = val;
+  }
+
+  const uniqueFields = Object.keys(rules).filter(f => rules[f].uniqueInForm);
+  uniqueFields.forEach(field => {
+    const vals = Object.values(indexedFields).map(row => row[field]).filter(Boolean);
+    const dups = findDuplicates(vals);
+    Object.entries(indexedFields).forEach(([i, row]) => {
+      if (dups.has(row[field])) errors[`${field}[${i}]`] = rules[field].messages.duplicate;
+    });
+  });
+
+  for (const [i, fields] of Object.entries(indexedFields)) {
+    for (const [f, v] of Object.entries(fields)) {
+      if (errors[`${f}[${i}]`]) continue;
+      const rule = rules[f];
+      if (!rule) continue;
+
+      if (rule.required && !v) errors[`${f}[${i}]`] = rule.messages.required;
+      else if (rule.pattern && !(new RegExp(rule.pattern)).test(v)) errors[`${f}[${i}]`] = rule.messages.pattern;
+      else if (rule.minLength && v.length < rule.minLength) errors[`${f}[${i}]`] = rule.messages.minLength;
+      else if (rule.maxLength && v.length > rule.maxLength) errors[`${f}[${i}]`] = rule.messages.maxLength;
+      else if (rule.choices && !rule.choices.includes(v)) errors[`${f}[${i}]`] = rule.messages.choices;
+      else {
+        const remote = await checkRemote(f, v, rule);
+        if (!remote.valid) errors[`${f}[${i}]`] = remote.error;
+      }
+    }
+  }
+
+  return errors;
+}
+
+// ここに統合したshowErrors関数
+export function showErrors(errors, rules) {
+  document.querySelectorAll('.error-input, .error-message').forEach(el => {
+    el.classList.remove('error-input');
+    el.textContent = '';
+  });
+
+  Object.entries(errors).forEach(([key, msg]) => {
+    const [field, idx] = key.match(/^(\w+)\[(\d+|single)\]$/).slice(1);
+    const input = idx === 'single'
+      ? document.getElementById(rules[field].id)
+      : document.querySelector(`[name="${field}[${idx}]"]`);
+    const errDiv = input.nextElementSibling?.classList.contains('error-message')
+      ? input.nextElementSibling
+      : input.insertAdjacentElement('afterend', Object.assign(document.createElement('div'), {className: 'error-message'}));
+
+    input.classList.add('error-input');
+    errDiv.textContent = msg;
+  });
+}
