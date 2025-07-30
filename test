@@ -1,36 +1,36 @@
-from sqlalchemy import func
+import os
+import base64
+from Crypto.Cipher import AES
+from base64 import urlsafe_b64encode, urlsafe_b64decode
 
-取得処理
-delete_names = {"test1", "test2"}
+class AESCipher:
+    def __init__(self, key_b64: str):
+        """
+        key_b64: Base64エンコードされた32バイトの文字列
+        """
+        self.key = base64.urlsafe_b64decode(key_b64)  # 32 bytes (AES-256)
+        if len(self.key) not in (16, 24, 32):
+            raise ValueError("AES key must be 16, 24, or 32 bytes")
 
-# Bの削除対象ではない行（残るB）の件数をAごとに集計
-remaining_b_subq = (
-    session.query(B.a_no.label("a_no"), func.count(B.id).label("remaining_count"))
-    .filter(~B.set_point_name.in_(delete_names))  # 削除しないB
-    .group_by(B.a_no)
-    .subquery()
-)
+    def pad(self, data: bytes, block_size: int = 16) -> bytes:
+        pad_len = block_size - (len(data) % block_size)
+        return data + bytes([pad_len] * pad_len)
 
-# Aに対してJOINし、Bが残らないものだけに絞る
-a_candidates = (
-    session.query(A)
-    .outerjoin(remaining_b_subq, A.no == remaining_b_subq.c.a_no)
-    .filter(remaining_b_subq.c.remaining_count == None)  # Bが残らないA
-    .join(B, A.no == B.a_no)
-    .filter(B.set_point_name.in_(delete_names))  # Aに削除対象Bが紐づいている
-    .distinct()
-    .all()
-)
+    def unpad(self, data: bytes) -> bytes:
+        pad_len = data[-1]
+        return data[:-pad_len]
 
+    def encrypt(self, plain_text: str) -> str:
+        iv = os.urandom(16)
+        cipher = AES.new(self.key, AES.MODE_CBC, iv)
+        padded = self.pad(plain_text.encode())
+        encrypted = cipher.encrypt(padded)
+        return urlsafe_b64encode(iv + encrypted).decode()
 
-削除処理
-# 確認後に削除対象AのNoリストを作る
-a_nos_to_delete = [a.no for a in a_candidates]
-
-# Bの削除
-session.query(B).filter(B.set_point_name.in_(delete_names)).delete(synchronize_session=False)
-
-# Aの削除
-session.query(A).filter(A.no.in_(a_nos_to_delete)).delete(synchronize_session=False)
-
-session.commit()
+    def decrypt(self, encrypted_b64: str) -> str:
+        raw = urlsafe_b64decode(encrypted_b64)
+        iv = raw[:16]
+        encrypted = raw[16:]
+        cipher = AES.new(self.key, AES.MODE_CBC, iv)
+        decrypted = cipher.decrypt(encrypted)
+        return self.unpad(decrypted).decode()
