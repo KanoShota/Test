@@ -1,36 +1,59 @@
-import os
-import base64
-from Crypto.Cipher import AES
-from base64 import urlsafe_b64encode, urlsafe_b64decode
+from flask import Flask, request
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import scoped_session, sessionmaker, declarative_base, Session as SASession
+import gc
+import psutil
 
-class AESCipher:
-    def __init__(self, key_b64: str):
-        """
-        key_b64: Base64エンコードされた32バイトの文字列
-        """
-        self.key = base64.urlsafe_b64decode(key_b64)  # 32 bytes (AES-256)
-        if len(self.key) not in (16, 24, 32):
-            raise ValueError("AES key must be 16, 24, or 32 bytes")
+# DB & Session設定
+Base = declarative_base()
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
 
-    def pad(self, data: bytes, block_size: int = 16) -> bytes:
-        pad_len = block_size - (len(data) % block_size)
-        return data + bytes([pad_len] * pad_len)
+engine = create_engine("sqlite:///test.db", echo=False)
+Session = scoped_session(sessionmaker(bind=engine))
+Base.metadata.create_all(engine)
 
-    def unpad(self, data: bytes) -> bytes:
-        pad_len = data[-1]
-        return data[:-pad_len]
+# 初期データ
+s = Session()
+if s.query(User).count() == 0:
+    s.add_all([User(name=f"user_{i}") for i in range(1000)])
+    s.commit()
+Session.remove()
 
-    def encrypt(self, plain_text: str) -> str:
-        iv = os.urandom(16)
-        cipher = AES.new(self.key, AES.MODE_CBC, iv)
-        padded = self.pad(plain_text.encode())
-        encrypted = cipher.encrypt(padded)
-        return urlsafe_b64encode(iv + encrypted).decode()
+# Flaskアプリ
+app = Flask(__name__)
+PROC = psutil.Process()
 
-    def decrypt(self, encrypted_b64: str) -> str:
-        raw = urlsafe_b64decode(encrypted_b64)
-        iv = raw[:16]
-        encrypted = raw[16:]
-        cipher = AES.new(self.key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
-        return self.unpad(decrypted).decode()
+@app.before_request
+def before_request():
+    s = Session()
+    rss_kb = PROC.memory_info().rss // 1024
+    live_sessions = sum(isinstance(obj, SASession) for obj in gc.get_objects())
+    print(f"[BEGIN] {request.path} session_id={id(s)} identity_map={len(s.identity_map)} live_sessions≈{live_sessions} rss_kb={rss_kb}")
+
+@app.after_request
+def after_request(response):
+    s = Session()
+    rss_kb = PROC.memory_info().rss // 1024
+    live_sessions = sum(isinstance(obj, SASession) for obj in gc.get_objects())
+    print(f"[AFTER] {request.path} session_id={id(s)} identity_map={len(s.identity_map)} live_sessions≈{live_sessions} rss_kb={rss_kb}")
+    return response
+
+@app.teardown_appcontext
+def teardown(exception=None):
+    # ★ remove にするとセッション再利用せず毎回新規
+    Session.remove()
+    rss_kb = PROC.memory_info().rss // 1024
+    live_sessions = sum(isinstance(obj, SASession) for obj in gc.get_objects())
+    print(f"[END] live_sessions≈{live_sessions} rss_kb={rss_kb}")
+
+@app.get("/users")
+def list_users():
+    s = Session()
+    rows = s.query(User).limit(200).all()  # Identity Mapに200件乗せる
+    return {"rows": len(rows)}
+
+if __name__ == "__main__":
+    app.run(debug=True)
