@@ -1,195 +1,78 @@
-# cf_cookies.py
-# CloudFront 署名付きCookieを Flask で発行/更新/削除するための Blueprint
-# 前提：CloudFront の「Public keys」に公開鍵を登録し、Key Group を作成して
-#       ディストリの「Trusted key groups」に追加済みであること。
-
-import os
-import json
-import base64
-import datetime as dt
-from typing import Optional, Dict
-
-from flask import Blueprint, request, make_response, current_app, abort, jsonify
+# cf_cookie_min_hardcoded.py
+# pip install botocore cryptography
+import json, datetime as dt
+from flask import Blueprint, make_response, request, abort, jsonify
 from botocore.signers import CloudFrontSigner
 from cryptography.hazmat.primitives import serialization
 
-bp = Blueprint("cf_cookie", __name__, url_prefix="/auth/cf-cookie")
+bp = Blueprint("cf_cookie_min", __name__)
 
-# ==== 必要な設定（環境変数 or Flask config で与える）=========================
-# 必須:
-#   CF_KEY_PAIR_ID            : CloudFront "Public key" の Key ID（例: K123ABC...）
-#   CF_DOMAIN                 : CloudFront 配信のドメイン（例: video.example.com）
-#   COOKIE_DOMAIN             : Cookie を送るドメイン（例: .example.com または video.example.com）
-#
-# どちらか片方:
-#   CF_PRIVATE_KEY_PEM        : 秘密鍵（PEM 文字列, \n を含む）。※環境変数に入れる場合は base64 推奨
-#   CF_PRIVATE_KEY_PATH       : 秘密鍵（PEM ファイルパス）
-#
-# 任意:
-#   CF_COOKIE_DEFAULT_TTL_SEC : Cookie の標準 TTL（秒）。未指定は 600 (= 10分)
-#   CF_COOKIE_RESOURCE_PATH   : 許可するパス（例: /protected/*）。未指定は全体 "/*"
-#   CF_COOKIE_BIND_CLIENT_IP  : "true" ならクライアントIPに縛る（モバイルには非推奨）
-# =============================================================================
+# ==== ここだけ書き換えればOK ==========================================
+CF_KEY_PAIR_ID = "KXXXXXXXXXXXXXXXXX"          # CloudFront Public key の Key ID
+CF_DOMAIN      = "video.dev.example.com"       # CloudFront の配信ドメイン（CNAME 推奨）
+COOKIE_DOMAIN  = ".dev.example.com"            # Cookie を送るドメイン（配信に届くように親ドメインを揃える）
+TTL_SEC        = 600                           # 10分（最初はこれでOK）
+RESOURCE_PATH  = "/protected/*"                # Cookie を有効にするパス
 
+# Secureクッキー: ローカルの http でテストするだけなら False にするとCookieは入る（がCFには届かない）
+SECURE_COOKIE  = True
 
-def _get_config(key: str, default: Optional[str] = None) -> Optional[str]:
-    # Flask config > env の順で取得
-    return current_app.config.get(key, os.getenv(key, default))
-
+# 秘密鍵（どちらか片方でOK）
+CF_PRIVATE_KEY_PEM = b"""-----BEGIN PRIVATE KEY-----
+...ここにあなたのPEM（秘密鍵）...
+-----END PRIVATE KEY-----"""
+# CF_PRIVATE_KEY_PATH = "cf_private_key.pem"
+# =====================================================================
 
 def _load_private_key_bytes() -> bytes:
-    pem_b64 = _get_config("CF_PRIVATE_KEY_PEM_B64")  # 推奨：改行問題を避ける
-    if pem_b64:
-        return base64.b64decode(pem_b64)
-
-    pem = _get_config("CF_PRIVATE_KEY_PEM")
-    if pem:
-        return pem.encode("utf-8")
-
-    path = _get_config("CF_PRIVATE_KEY_PATH")
-    if path and os.path.exists(path):
-        with open(path, "rb") as f:
-            return f.read()
-
-    raise RuntimeError(
-        "CloudFront 秘密鍵が見つかりません。CF_PRIVATE_KEY_PEM_B64 / CF_PRIVATE_KEY_PEM / CF_PRIVATE_KEY_PATH のいずれかを設定してください。"
-    )
-
+    if CF_PRIVATE_KEY_PEM and b"BEGIN" in CF_PRIVATE_KEY_PEM:
+        return CF_PRIVATE_KEY_PEM
+    # ファイルで持つ場合は↑を空にしてこっちを使う
+    # with open(CF_PRIVATE_KEY_PATH, "rb") as f:
+    #     return f.read()
+    raise RuntimeError("秘密鍵が未設定です。CF_PRIVATE_KEY_PEM または CF_PRIVATE_KEY_PATH を設定してください。")
 
 def _rsa_signer(message: bytes) -> bytes:
-    private_key_pem = _load_private_key_bytes()
-    private_key = serialization.load_pem_private_key(private_key_pem, password=None)
-    return private_key.sign(message)
-
-
-def _build_policy(ttl_sec: int, client_ip: Optional[str] = None) -> bytes:
-    """
-    CloudFront の "Custom policy"（署名付きCookie用）を JSON で作り、bytes で返す。
-    - 有効期限（DateLessThan）は必須
-    - Resource は "https://{CF_DOMAIN}{path}" を許可
-    - 任意で IP アドレスを縛る（AWS:SourceIp）。モバイル回線/IPv6 では不具合になりがちなので既定は無効。
-    """
-    cf_domain = _get_config("CF_DOMAIN")
-    if not cf_domain:
-        raise RuntimeError("CF_DOMAIN が未設定です。例: video.example.com")
-
-    path = _get_config("CF_COOKIE_RESOURCE_PATH", "/*")
-    resource = f"https://{cf_domain}{path}"
-
-    expire_epoch = int((dt.datetime.utcnow() + dt.timedelta(seconds=ttl_sec)).timestamp())
-
-    cond: Dict[str, dict] = {"DateLessThan": {"AWS:EpochTime": expire_epoch}}
-    if _get_config("CF_COOKIE_BIND_CLIENT_IP", "false").lower() == "true" and client_ip:
-        # 例: "203.0.113.4/32" 形式（IPv6 は /128）。簡易化のため /32 固定。
-        # 実運用では X-Forwarded-For の先頭を使う等の正規化を行うこと。
-        cond["IpAddress"] = {"AWS:SourceIp": f"{client_ip}/32"}
-
-    policy = {
-        "Statement": [{
-            "Resource": resource,
-            "Condition": cond
-        }]
-    }
-    return json.dumps(policy).encode("utf-8")
-
-
-def _default_ttl() -> int:
-    return int(_get_config("CF_COOKIE_DEFAULT_TTL_SEC", "600"))  # 10分
-
-
-def _cookie_common_kwargs(ttl_sec: int) -> dict:
-    """
-    Set-Cookie の共通属性。SameSite は Lax（埋め込み攻撃を減らしつつ、同一サイト内での配信に送出）。
-    配信ドメインが video.example.com、アプリが app.example.com の場合は Domain=.example.com を使う。
-    """
-    domain = _get_config("COOKIE_DOMAIN")
-    if not domain:
-        raise RuntimeError("COOKIE_DOMAIN が未設定です。例: .example.com もしくは video.example.com")
-
-    return dict(
-        max_age=ttl_sec,
-        secure=True,
-        httponly=True,
-        samesite="Lax",
-        domain=domain,
-        path="/",
-    )
-
-
-def _generate_signed_cookies(ttl_sec: int, client_ip: Optional[str]) -> Dict[str, str]:
-    key_pair_id = _get_config("CF_KEY_PAIR_ID")
-    if not key_pair_id:
-        raise RuntimeError("CF_KEY_PAIR_ID（CloudFront Public key の Key ID）が未設定です。")
-
-    signer = CloudFrontSigner(key_pair_id, _rsa_signer)
-    policy = _build_policy(ttl_sec=ttl_sec, client_ip=client_ip)
-    # 署名付き Cookie を生成（CloudFront-Policy / -Signature / -Key-Pair-Id）
-    cookies = signer.generate_signed_cookie(url=None, policy=policy)
-    return cookies
-
-
-def _client_ip() -> Optional[str]:
-    # プロキシ経由を想定：X-Forwarded-For の先頭を拾う
-    xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.remote_addr
-
+    key = serialization.load_pem_private_key(_load_private_key_bytes(), password=None)
+    return key.sign(message)
 
 def _require_authenticated_user():
-    # ここはあなたの認証仕様に合わせて置き換えてください
-    # 例：Flask-Loginなら current_user.is_authenticated など
-    user_id = getattr(request, "user_id", None)
-    if not user_id:
-        abort(401, "login required")
-    return user_id
+    # 既存の認証判定に置き換えてください（下行はダミー）
+    if not request.headers.get("X-Dummy-Auth"):
+        abort(401)
 
-
-@bp.post("/issue")
-def issue_cookie():
-    """
-    ログイン直後などに呼び出す: 署名付き Cookie を新規発行
-    リクエストボディ例: {"ttlSec": 600}
-    """
+@bp.post("/issue")   # ログイン直後に呼ぶ
+def issue():
     _require_authenticated_user()
 
-    body = request.get_json(silent=True) or {}
-    ttl_sec = int(body.get("ttlSec") or _default_ttl())
+    expire = int((dt.datetime.utcnow() + dt.timedelta(seconds=TTL_SEC)).timestamp())
+    policy = {
+        "Statement": [{
+            "Resource": f"https://{CF_DOMAIN}{RESOURCE_PATH}",
+            "Condition": {"DateLessThan": {"AWS:EpochTime": expire}}
+        }]
+    }
 
-    cookies = _generate_signed_cookies(ttl_sec=ttl_sec, client_ip=_client_ip())
-    resp = make_response(jsonify({"ok": True, "ttlSec": ttl_sec}))
-    common = _cookie_common_kwargs(ttl_sec)
+    signer = CloudFrontSigner(CF_KEY_PAIR_ID, _rsa_signer)
+    cookies = signer.generate_signed_cookie(url=None, policy=json.dumps(policy).encode("utf-8"))
 
-    # CloudFront が期待する 3 つの Cookie をセット
+    resp = make_response(jsonify({"ok": True, "ttlSec": TTL_SEC}))
+    common = dict(
+        max_age=TTL_SEC,
+        secure=SECURE_COOKIE,
+        httponly=True,
+        samesite="Lax",
+        domain=COOKIE_DOMAIN,
+        path="/",
+    )
     for k, v in cookies.items():
         resp.set_cookie(k, v, **common)
     return resp
 
-
-@bp.post("/refresh")
-def refresh_cookie():
-    """
-    視聴中の定期更新用: JS から数分おきに叩く
-    """
-    _require_authenticated_user()
-
-    ttl_sec = _default_ttl()
-    cookies = _generate_signed_cookies(ttl_sec=ttl_sec, client_ip=_client_ip())
-    resp = make_response(jsonify({"ok": True, "ttlSec": ttl_sec}))
-    common = _cookie_common_kwargs(ttl_sec)
-
-    for k, v in cookies.items():
-        resp.set_cookie(k, v, **common)
-    return resp
-
-
-@bp.post("/clear")
-def clear_cookie():
-    """
-    ログアウト時などに Cookie を無効化（即時失効）
-    """
+@bp.post("/clear")   # ログアウト時など
+def clear():
     resp = make_response(jsonify({"ok": True}))
     for k in ("CloudFront-Policy", "CloudFront-Signature", "CloudFront-Key-Pair-Id"):
-        resp.set_cookie(k, "", max_age=0, secure=True, httponly=True, samesite="Lax",
-                        domain=_get_config("COOKIE_DOMAIN"), path="/")
+        resp.set_cookie(k, "", max_age=0, secure=SECURE_COOKIE, httponly=True, samesite="Lax",
+                        domain=COOKIE_DOMAIN, path="/")
     return resp
