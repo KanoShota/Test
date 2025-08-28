@@ -1,4 +1,4 @@
-# cf_cookie_min_bare_manual.py
+# cf_cookie_cookiebase64.py
 # pip install cryptography
 import json, base64, datetime as dt
 from flask import Blueprint, make_response, jsonify
@@ -7,78 +7,76 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 bp = Blueprint("cf_cookie", __name__)
 
-# ==== あなたの値に置き換え ==========================================
+# ==== あなたの値に置換 ==========================================
 CF_KEY_PAIR_ID = "K3CEXAMPLE123456"
 CF_DOMAIN      = "video.c2-connect-dev.com"
 COOKIE_DOMAIN  = ".c2-connect-dev.com"
 TTL_SEC        = 600
-RESOURCE_PATH  = "/protected/*"     # CloudFront の Behavior と一致させる
-SAMESITE       = "Lax"              # クロスサイトなら "None"
+
+# ▼どちらかを使う（A: 1ファイルだけ許可 / B: ディレクトリ配下許可）
+USE_SINGLE_OBJECT = True
+RESOURCE_URL   = "https://video.c2-connect-dev.com/HARW01_20250826092243_100.mp4"  # A 用
+RESOURCE_PATH  = "/protected/*"                                                     # B 用
+
+SAMESITE       = "Lax"   # 異ドメイン（localhost 等）から叩く時は "None"
 SECURE_COOKIE  = True
 
 CF_PRIVATE_KEY_PEM = b"""-----BEGIN PRIVATE KEY-----
 ...あなたの秘密鍵PEM...
 -----END PRIVATE KEY-----"""
-# ====================================================================
+# ===============================================================
 
-def _b64urlsafe(b: bytes) -> str:
-    # CloudFront 要件のURL/CookieセーフBase64（+/= の代替）
-    return base64.b64encode(b).decode("utf-8").replace("+","-").replace("=","_").replace("/","~")
-
-def _signed_cookie_pair(ttl_sec: int = TTL_SEC) -> dict:
-    """CloudFront 署名付きCookie(3個)を手動生成"""
+def _policy_bytes(ttl_sec: int) -> bytes:
     expire_epoch = int((dt.datetime.utcnow() + dt.timedelta(seconds=ttl_sec)).timestamp())
-    policy_obj = {
+    resource = RESOURCE_URL if USE_SINGLE_OBJECT else f"https://{CF_DOMAIN}{RESOURCE_PATH}"
+    obj = {
         "Statement": [{
-            "Resource": f"https://{CF_DOMAIN}{RESOURCE_PATH}",
+            "Resource": resource,
             "Condition": {"DateLessThan": {"AWS:EpochTime": expire_epoch}}
         }]
     }
-    # 余計な空白を省いて安定化
-    policy_bytes = json.dumps(policy_obj, separators=(",", ":")).encode("utf-8")
+    # 余分な空白を削ったJSON（署名安定のため）
+    return json.dumps(obj, separators=(",", ":")).encode("utf-8")
 
-    # RSA(PKCS#1 v1.5) + SHA1 で署名（CloudFront の期待どおり）
-    private_key = serialization.load_pem_private_key(CF_PRIVATE_KEY_PEM, password=None)
-    signature = private_key.sign(policy_bytes, padding.PKCS1v15(), hashes.SHA1())
+def _sign_sha1_pkcs1v15(data: bytes) -> bytes:
+    key = serialization.load_pem_private_key(CF_PRIVATE_KEY_PEM, password=None)
+    return key.sign(data, padding.PKCS1v15(), hashes.SHA1())
 
+def _make_cookies(ttl_sec: int = TTL_SEC) -> dict:
+    policy = _policy_bytes(ttl_sec)
+    sig    = _sign_sha1_pkcs1v15(policy)
+    # ★Cookieは「標準Base64」のままでOK（URL-safe置換はしない）
+    policy_b64 = base64.b64encode(policy).decode("ascii")
+    sig_b64    = base64.b64encode(sig).decode("ascii")
     return {
-        "CloudFront-Policy":      _b64urlsafe(policy_bytes),
-        "CloudFront-Signature":   _b64urlsafe(signature),
+        "CloudFront-Policy":      policy_b64,
+        "CloudFront-Signature":   sig_b64,
         "CloudFront-Key-Pair-Id": CF_KEY_PAIR_ID,
     }
 
-# ---------------- 署名Cookieの発行（べた書き・ループ無し） ----------------
+# ---------------- 発行（ループ無し・べた書き） ----------------
 @bp.route("/auth/cf-cookie/issue", methods=["POST", "GET"])
 def issue():
-    cookies = _signed_cookie_pair(600)  # TTL=600秒に固定
+    cookies = _make_cookies(600)
 
     resp = make_response(jsonify({"ok": True, "ttlSec": 600}))
-    # 共通属性も値を直書き
     resp.set_cookie("CloudFront-Policy",      cookies["CloudFront-Policy"],
-                    max_age=600, secure=True, httponly=True,
-                    samesite="Lax", domain=".c2-connect-dev.com", path="/")
+                    max_age=600, secure=SECURE_COOKIE, httponly=True,
+                    samesite=SAMESITE, domain=COOKIE_DOMAIN, path="/")
     resp.set_cookie("CloudFront-Signature",   cookies["CloudFront-Signature"],
-                    max_age=600, secure=True, httponly=True,
-                    samesite="Lax", domain=".c2-connect-dev.com", path="/")
+                    max_age=600, secure=SECURE_COOKIE, httponly=True,
+                    samesite=SAMESITE, domain=COOKIE_DOMAIN, path="/")
     resp.set_cookie("CloudFront-Key-Pair-Id", cookies["CloudFront-Key-Pair-Id"],
-                    max_age=600, secure=True, httponly=True,
-                    samesite="Lax", domain=".c2-connect-dev.com", path="/")
+                    max_age=600, secure=SECURE_COOKIE, httponly=True,
+                    samesite=SAMESITE, domain=COOKIE_DOMAIN, path="/")
     return resp
 
-# ---------------- 署名Cookieの削除（べた書き・ループ無し） ----------------
+# ---------------- 削除（ループ無し・べた書き） ----------------
 @bp.route("/auth/cf-cookie/clear", methods=["POST", "GET"])
 def clear():
     resp = make_response(jsonify({"ok": True}))
-    # 発行時と同じ domain/path で確実に削除（ここが超重要）
-    resp.delete_cookie("CloudFront-Policy",      domain=".c2-connect-dev.com", path="/")
-    resp.delete_cookie("CloudFront-Signature",   domain=".c2-connect-dev.com", path="/")
-    resp.delete_cookie("CloudFront-Key-Pair-Id", domain=".c2-connect-dev.com", path="/")
-
-    # もし過去に domain なし（host-only）や video.* で発行していた可能性があるなら、念のため追加削除
-    # resp.delete_cookie("CloudFront-Policy", path="/")
-    # resp.delete_cookie("CloudFront-Signature", path="/")
-    # resp.delete_cookie("CloudFront-Key-Pair-Id", path="/")
-    # resp.delete_cookie("CloudFront-Policy",      domain="video.c2-connect-dev.com", path="/")
-    # resp.delete_cookie("CloudFront-Signature",   domain="video.c2-connect-dev.com", path="/")
-    # resp.delete_cookie("CloudFront-Key-Pair-Id", domain="video.c2-connect-dev.com", path="/")
+    # 発行と同じ domain/path で削除（重要）
+    resp.delete_cookie("CloudFront-Policy",      domain=COOKIE_DOMAIN, path="/")
+    resp.delete_cookie("CloudFront-Signature",   domain=COOKIE_DOMAIN, path="/")
+    resp.delete_cookie("CloudFront-Key-Pair-Id", domain=COOKIE_DOMAIN, path="/")
     return resp
