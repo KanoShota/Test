@@ -21,3 +21,4 @@ document.getElementById('logout').addEventListener('click', async () => {
   location.replace('/login');
 });
 </script>
+Cache-Control: public, max-age=0, must-revalidate, s-maxage=86400, stale-while-revalidate=60, stale-if-error=600
