@@ -1,0 +1,23 @@
+<button id="logout">ログアウト</button>
+<video id="v" controls src="https://video.example.com/protected/movie.mp4"></video>
+
+<script>
+async function nukeVideoBuffers(v){
+  try { if (document.pictureInPictureElement) await document.exitPictureInPicture(); } catch(e){}
+  try { v.pause(); } catch(e){}
+  // MSE/ストリームの可能性に備えて切断
+  try { v.srcObject = null; } catch(e){}
+  // 受信済みデータを捨てる基本手順
+  try { v.removeAttribute('src'); } catch(e){}
+  try { v.load(); } catch(e){}
+}
+
+document.getElementById('logout').addEventListener('click', async () => {
+  const v = document.getElementById('v');
+  await nukeVideoBuffers(v);
+  // 署名Cookieをサーバ側で削除
+  await fetch('/auth/cf-cookie/clear', {method:'POST', credentials:'include'});
+  // 画面遷移でブラウザキャッシュも避ける
+  location.replace('/login');
+});
+</script>
