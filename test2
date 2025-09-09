@@ -1,24 +1,91 @@
-<button id="logout">ログアウト</button>
-<video id="v" controls src="https://video.example.com/protected/movie.mp4"></video>
+import boto3
+import json
+from datetime import datetime, timedelta
+from botocore.signers import CloudFrontSigner
+import rsa
 
-<script>
-async function nukeVideoBuffers(v){
-  try { if (document.pictureInPictureElement) await document.exitPictureInPicture(); } catch(e){}
-  try { v.pause(); } catch(e){}
-  // MSE/ストリームの可能性に備えて切断
-  try { v.srcObject = null; } catch(e){}
-  // 受信済みデータを捨てる基本手順
-  try { v.removeAttribute('src'); } catch(e){}
-  try { v.load(); } catch(e){}
-}
+class CloudFrontCookieGenerator:
+    def __init__(self, key_id, private_key_path):
+        self.key_id = key_id
+        with open(private_key_path, 'r') as key_file:
+            self.private_key = rsa.PrivateKey.load_pkcs1(key_file.read().encode())
+        
+    def rsa_signer(self, message):
+        return rsa.sign(message, self.private_key, 'SHA-1')
+    
+    def create_signed_cookies(self, resource_patterns, expire_time):
+        """
+        複数のリソースパターンに対応したCookieを生成
+        """
+        cloudfront_signer = CloudFrontSigner(self.key_id, self.rsa_signer)
+        
+        # Policyの作成（複数リソースに対応）
+        policy = {
+            "Statement": [
+                {
+                    "Resource": resource_patterns,  # リストで複数指定可能
+                    "Condition": {
+                        "DateLessThan": {
+                            "AWS:EpochTime": int(expire_time.timestamp())
+                        }
+                    }
+                }
+            ]
+        }
+        
+        policy_json = json.dumps(policy, separators=(',', ':'))
+        
+        # 署名付きCookieの生成
+        signed_cookies = cloudfront_signer.generate_presigned_url(
+            url='dummy',  # Cookieの場合は使用されない
+            policy=policy_json
+        )
+        
+        return {
+            'CloudFront-Policy': policy_json,
+            'CloudFront-Signature': signed_cookies['Signature'],
+            'CloudFront-Key-Pair-Id': self.key_id
+        }
 
-document.getElementById('logout').addEventListener('click', async () => {
-  const v = document.getElementById('v');
-  await nukeVideoBuffers(v);
-  // 署名Cookieをサーバ側で削除
-  await fetch('/auth/cf-cookie/clear', {method:'POST', credentials:'include'});
-  // 画面遷移でブラウザキャッシュも避ける
-  location.replace('/login');
-});
-</script>
-Cache-Control: public, max-age=0, must-revalidate, s-maxage=86400, stale-while-revalidate=60, stale-if-error=600
+
+
+# Flask アプリケーションでの実装例
+from flask import Flask, make_response, request
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+
+@app.route('/authorize')
+def create_signed_cookies():
+    # 複数のリソースパターンを指定
+    resource_patterns = [
+        "https://your-distribution.cloudfront.net/videos/*",
+        "https://your-distribution.cloudfront.net/thumbnails/*",
+        "https://your-distribution.cloudfront.net/subtitles/*"
+    ]
+    
+    expire_time = datetime.utcnow() + timedelta(hours=24)
+    
+    cookie_generator = CloudFrontCookieGenerator(
+        key_id='YOUR_KEY_PAIR_ID',
+        private_key_path='path/to/private_key.pem'
+    )
+    
+    signed_cookies = cookie_generator.create_signed_cookies(
+        resource_patterns, expire_time
+    )
+    
+    response = make_response("認証成功")
+    
+    # Cookieを設定
+    for cookie_name, cookie_value in signed_cookies.items():
+        response.set_cookie(
+            cookie_name,
+            cookie_value,
+            domain='.your-domain.com',
+            secure=True,
+            httponly=True,
+            samesite='Strict'
+        )
+    
+    return response
