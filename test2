@@ -89,3 +89,39 @@ def create_signed_cookies():
         )
     
     return response
+
+
+class SimplifiedCloudFrontSigner:
+    def __init__(self, key_pair_id, private_key_content):
+        self.key_pair_id = key_pair_id
+        self.private_key = rsa.PrivateKey.load_pkcs1(private_key_content.encode())
+    
+    def generate_cookies(self, urls, expires_in_hours=24):
+        expire_time = datetime.utcnow() + timedelta(hours=expires_in_hours)
+        
+        # Policy作成
+        policy = {
+            "Statement": [{
+                "Resource": urls,
+                "Condition": {
+                    "DateLessThan": {"AWS:EpochTime": int(expire_time.timestamp())}
+                }
+            }]
+        }
+        
+        policy_json = json.dumps(policy, separators=(',', ':'))
+        
+        # エンコードと署名
+        encoded_policy = base64.b64encode(policy_json.encode()).decode()
+        encoded_policy = encoded_policy.replace('+', '-').replace('=', '_').replace('/', '~')
+        
+        signature = rsa.sign(policy_json.encode(), self.private_key, 'SHA-1')
+        encoded_signature = base64.b64encode(signature).decode()
+        encoded_signature = encoded_signature.replace('+', '-').replace('=', '_').replace('/', '~')
+        
+        return {
+            'CloudFront-Policy': encoded_policy,
+            'CloudFront-Signature': encoded_signature,
+            'CloudFront-Key-Pair-Id': self.key_pair_id
+        }
+
