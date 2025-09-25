@@ -1,82 +1,56 @@
-# cf_cookie_cookiebase64.py
-# pip install cryptography
-import json, base64, datetime as dt
-from flask import Blueprint, make_response, jsonify
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+sudo apt update
+sudo apt install -y libreoffice libreoffice-calc libreoffice-common \
+                    python3-venv
+# 日本語表示用フォント（推奨）
+sudo apt install -y fonts-noto-cjk fonts-ipafont-gothic fonts-ipafont-mincho \
+                    fonts-noto-color-emoji
 
-bp = Blueprint("cf_cookie", __name__)
+# サンプル: uploads/売上.xlsx を用意してから
+libreoffice --headless --convert-to pdf --outdir ./out ./uploads/売上.xlsx
+# → ./out/売上.pdf ができればOK
 
-# ==== あなたの値に置換 ==========================================
-CF_KEY_PAIR_ID = "K3CEXAMPLE123456"
-CF_DOMAIN      = "video.c2-connect-dev.com"
-COOKIE_DOMAIN  = ".c2-connect-dev.com"
-TTL_SEC        = 600
 
-# ▼どちらかを使う（A: 1ファイルだけ許可 / B: ディレクトリ配下許可）
-USE_SINGLE_OBJECT = True
-RESOURCE_URL   = "https://video.c2-connect-dev.com/HARW01_20250826092243_100.mp4"  # A 用
-RESOURCE_PATH  = "/protected/*"                                                     # B 用
+# app.py
+from flask import Flask, send_file, abort
+import subprocess, tempfile, shutil
+from pathlib import Path
 
-SAMESITE       = "Lax"   # 異ドメイン（localhost 等）から叩く時は "None"
-SECURE_COOKIE  = True
+app = Flask(__name__)
+UPLOAD_DIR = Path("uploads")
+OUT_DIR = Path("out")
+OUT_DIR.mkdir(exist_ok=True)
 
-CF_PRIVATE_KEY_PEM = b"""-----BEGIN PRIVATE KEY-----
-...あなたの秘密鍵PEM...
------END PRIVATE KEY-----"""
-# ===============================================================
+def convert_xlsx_to_pdf(xls_path: Path, pdf_path: Path):
+    if not xls_path.exists():
+        abort(404, "Excelファイルが見つかりません")
 
-def _policy_bytes(ttl_sec: int) -> bytes:
-    expire_epoch = int((dt.datetime.utcnow() + dt.timedelta(seconds=ttl_sec)).timestamp())
-    resource = RESOURCE_URL if USE_SINGLE_OBJECT else f"https://{CF_DOMAIN}{RESOURCE_PATH}"
-    obj = {
-        "Statement": [{
-            "Resource": resource,
-            "Condition": {"DateLessThan": {"AWS:EpochTime": expire_epoch}}
-        }]
-    }
-    # 余分な空白を削ったJSON（署名安定のため）
-    return json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    # 既にPDFがあり、元より新しければ再変換しない
+    if pdf_path.exists() and pdf_path.stat().st_mtime >= xls_path.stat().st_mtime:
+        return
 
-def _sign_sha1_pkcs1v15(data: bytes) -> bytes:
-    key = serialization.load_pem_private_key(CF_PRIVATE_KEY_PEM, password=None)
-    return key.sign(data, padding.PKCS1v15(), hashes.SHA1())
+    tmp_profile = Path(tempfile.mkdtemp(prefix="lo-profile-"))
+    try:
+        # -env:UserInstallation を使うと並列時のロック競合を避けられます
+        cmd = [
+            "libreoffice",
+            "--headless",
+            f"-env:UserInstallation=file://{tmp_profile.as_posix()}",
+            "--convert-to", "pdf",  # 書式をより厳密にしたいなら "pdf:calc_pdf_Export"
+            "--outdir", str(OUT_DIR),
+            str(xls_path)
+        ]
+        subprocess.run(cmd, check=True, timeout=120)
+        if not pdf_path.exists():
+            abort(500, "PDF 生成に失敗しました")
+    finally:
+        shutil.rmtree(tmp_profile, ignore_errors=True)
 
-def _make_cookies(ttl_sec: int = TTL_SEC) -> dict:
-    policy = _policy_bytes(ttl_sec)
-    sig    = _sign_sha1_pkcs1v15(policy)
-    # ★Cookieは「標準Base64」のままでOK（URL-safe置換はしない）
-    policy_b64 = base64.b64encode(policy).decode("ascii")
-    sig_b64    = base64.b64encode(sig).decode("ascii")
-    return {
-        "CloudFront-Policy":      policy_b64,
-        "CloudFront-Signature":   sig_b64,
-        "CloudFront-Key-Pair-Id": CF_KEY_PAIR_ID,
-    }
+@app.route("/excel/<path:filename>")
+def excel_to_pdf(filename):
+    xls_path = UPLOAD_DIR / filename
+    pdf_path = OUT_DIR / (Path(filename).stem + ".pdf")
+    convert_xlsx_to_pdf(xls_path, pdf_path)
+    return send_file(pdf_path, mimetype="application/pdf")
 
-# ---------------- 発行（ループ無し・べた書き） ----------------
-@bp.route("/auth/cf-cookie/issue", methods=["POST", "GET"])
-def issue():
-    cookies = _make_cookies(600)
-
-    resp = make_response(jsonify({"ok": True, "ttlSec": 600}))
-    resp.set_cookie("CloudFront-Policy",      cookies["CloudFront-Policy"],
-                    max_age=600, secure=SECURE_COOKIE, httponly=True,
-                    samesite=SAMESITE, domain=COOKIE_DOMAIN, path="/")
-    resp.set_cookie("CloudFront-Signature",   cookies["CloudFront-Signature"],
-                    max_age=600, secure=SECURE_COOKIE, httponly=True,
-                    samesite=SAMESITE, domain=COOKIE_DOMAIN, path="/")
-    resp.set_cookie("CloudFront-Key-Pair-Id", cookies["CloudFront-Key-Pair-Id"],
-                    max_age=600, secure=SECURE_COOKIE, httponly=True,
-                    samesite=SAMESITE, domain=COOKIE_DOMAIN, path="/")
-    return resp
-
-# ---------------- 削除（ループ無し・べた書き） ----------------
-@bp.route("/auth/cf-cookie/clear", methods=["POST", "GET"])
-def clear():
-    resp = make_response(jsonify({"ok": True}))
-    # 発行と同じ domain/path で削除（重要）
-    resp.delete_cookie("CloudFront-Policy",      domain=COOKIE_DOMAIN, path="/")
-    resp.delete_cookie("CloudFront-Signature",   domain=COOKIE_DOMAIN, path="/")
-    resp.delete_cookie("CloudFront-Key-Pair-Id", domain=COOKIE_DOMAIN, path="/")
-    return resp
+if __name__ == "__main__":
+    app.run(debug=True)
