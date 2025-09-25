@@ -9,23 +9,139 @@ sudo apt install -y fonts-noto-cjk fonts-ipafont-gothic fonts-ipafont-mincho \
 libreoffice --headless --convert-to pdf --outdir ./out ./uploads/売上.xlsx
 # → ./out/売上.pdf ができればOK
 
+---------------------------------------------------------------------------------------------------------
 
-# 既存の import 群に追加
-from flask import url_for
+# app.py
+from flask import Flask, render_template_string, send_file, abort, request, redirect, url_for
+import subprocess, tempfile, shutil
+from pathlib import Path
+from datetime import datetime
 
-# 一覧ページのテンプレ（/）
+app = Flask(__name__)
+
+# 設定
+UPLOAD_DIR = Path("uploads")      # Excel置き場
+CACHE_DIR  = Path("out")          # 生成PDF置き場
+CACHE_DIR.mkdir(exist_ok=True, parents=True)
+UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
+ALLOWED_EXTS = {".xlsx", ".xlsm", ".xls"}
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB 上限（必要に応じて調整）
+
+def _is_allowed(filename: str) -> bool:
+    return Path(filename).suffix.lower() in ALLOWED_EXTS
+
+def _safe_basename(filename: str) -> str:
+    # パス区切りを除去してベース名のみ（Unicodeは保持）
+    return Path(filename).name
+
+def _unique_path(base_dir: Path, name: str) -> Path:
+    """重複時は 'name (2).ext' 形式でユニーク化"""
+    p = base_dir / name
+    if not p.exists():
+        return p
+    stem, suf = Path(name).stem, Path(name).suffix
+    i = 2
+    while True:
+        cand = base_dir / f"{stem} ({i}){suf}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+def convert_xlsx_to_pdf(xls_path: Path, pdf_path: Path):
+    if not xls_path.exists():
+        abort(404, "Excelが見つかりません")
+    # 既にPDFがあり新しければ再変換しない
+    if pdf_path.exists() and pdf_path.stat().st_mtime >= xls_path.stat().st_mtime:
+        return
+    # リクエストごとに一時プロファイル→並列変換のロック競合回避
+    tmp_profile = Path(tempfile.mkdtemp(prefix="lo-profile-"))
+    try:
+        cmd = [
+            "libreoffice", "--headless",
+            f"-env:UserInstallation=file://{tmp_profile.as_posix()}",
+            "--convert-to", "pdf:calc_pdf_Export",
+            "--outdir", str(CACHE_DIR), str(xls_path),
+        ]
+        subprocess.run(cmd, check=True, timeout=180)
+        if not pdf_path.exists():
+            abort(500, "PDF生成に失敗しました")
+    finally:
+        shutil.rmtree(tmp_profile, ignore_errors=True)
+
+# ====== 表示系 ======
+
+# PDFそのものを返す（iframeの中身）
+@app.route("/excel-pdf/<path:filename>")
+def excel_pdf(filename):
+    xls = UPLOAD_DIR / filename
+    pdf = CACHE_DIR / (Path(filename).stem + ".pdf")
+    convert_xlsx_to_pdf(xls, pdf)
+    return send_file(
+        pdf,
+        mimetype="application/pdf",
+        as_attachment=False,
+        download_name=pdf.name,  # 表示名
+        max_age=0,               # 必要に応じてキャッシュ調整
+        conditional=True,
+        etag=True,
+        last_modified=pdf.stat().st_mtime
+    )
+
+# 表示用ページ（ここをユーザーに見せる）
+PAGE = """
+<!doctype html><meta charset="utf-8">
+<title>{{ title }}</title>
+<style>body{margin:0} .v{width:100vw;height:100vh;border:0}</style>
+<iframe class="v" src="{{ src }}" allowfullscreen></iframe>
+"""
+@app.route("/view/<path:filename>")
+def view_excel(filename):
+    return render_template_string(
+        PAGE,
+        title=f"{filename} の表示",
+        src=f"/excel-pdf/{filename}"
+    )
+
+# ====== アップロード + 一覧 ======
+
 INDEX_HTML = """
 <!doctype html><meta charset="utf-8">
-<title>Excel 一覧</title>
+<title>Excel 一覧とアップロード</title>
 <style>
-  body{font-family:system-ui;margin:24px}
+  body{font-family:system-ui;margin:24px;line-height:1.6}
   h1{font-size:20px;margin:0 0 12px}
+  form{margin:16px 0;padding:12px;border:1px solid #ddd;border-radius:8px;background:#fafafa}
+  label{display:block;margin:8px 0 4px}
+  input[type="text"]{width:420px;max-width:100%;padding:6px}
+  input[type="file"]{padding:6px}
+  button{padding:8px 14px;border:0;border-radius:8px;box-shadow:0 1px 0 rgba(0,0,0,.05);cursor:pointer}
+  button.primary{background:#2f6fed;color:#fff}
   ul{padding-left:18px}
   li{margin:4px 0}
   .empty{color:#666}
+  .msg{padding:8px 12px;background:#f0f7ff;border:1px solid #cfe3ff;border-radius:8px;margin:12px 0}
   code{background:#f5f5f5;padding:2px 6px;border-radius:4px}
+  .small{color:#666;font-size:12px}
 </style>
+
 <h1>Excel 一覧（{{ files|length }} 件）</h1>
+
+{% if msg %}<div class="msg">{{ msg|safe }}</div>{% endif %}
+
+<form method="post" enctype="multipart/form-data">
+  <h2 style="font-size:16px;margin:0 0 8px">アップロード</h2>
+  <label>ファイル（.xlsx / .xlsm / .xls）</label>
+  <input type="file" name="file" accept=".xlsx,.xlsm,.xls" required>
+
+  <label>保存先サブフォルダ（任意）<span class="small">例: 部門A/2025</span></label>
+  <input type="text" name="subdir" placeholder="サブフォルダ/さらに下層 など（未指定で直下）">
+
+  <div style="margin-top:10px">
+    <button class="primary" type="submit">アップロード</button>
+  </div>
+  <div class="small" style="margin-top:6px">最大 {{ max_mb }} MB。重複名は自動で (2), (3)… とリネーム。</div>
+</form>
+
 {% if files %}
   <ul>
   {% for f in files %}
@@ -36,25 +152,66 @@ INDEX_HTML = """
   {% endfor %}
   </ul>
 {% else %}
-  <p class="empty">uploads/ に .xlsx / .xlsm / .xls を置くと一覧に出ます。</p>
+  <p class="empty">uploads/ に .xlsx / .xlsm / .xls を置くか、上のフォームからアップロードしてください。</p>
 {% endif %}
+
 <p>直接アクセス例：<code>/view/売上.xlsx</code> や <code>/excel-pdf/売上.xlsx</code></p>
 """
 
 def _iter_excels():
     """uploads/ 配下の Excel を相対パス（POSIX）で列挙"""
-    exts = {".xlsx", ".xlsm", ".xls"}
     if not UPLOAD_DIR.exists():
         return []
     files = []
     for p in UPLOAD_DIR.rglob("*"):
-        if p.is_file() and p.suffix.lower() in exts:
+        if p.is_file() and p.suffix.lower() in ALLOWED_EXTS:
             files.append(p.relative_to(UPLOAD_DIR).as_posix())
     return sorted(files)
 
-@app.route("/")
+@app.route("/", methods=["GET", "POST"])
 def index():
+    msg = ""
+    if request.method == "POST":
+        f = request.files.get("file")
+        subdir = (request.form.get("subdir") or "").strip().strip("/")
+
+        if not f or not f.filename:
+            msg = "ファイルが指定されていません。"
+        elif not _is_allowed(f.filename):
+            msg = "対応していない拡張子です。(.xlsx / .xlsm / .xls のみ)"
+        else:
+            # 保存先ディレクトリ
+            target_dir = UPLOAD_DIR
+            if subdir:
+                # サブフォルダの安全化（パストラバーサル対策）
+                safe_subdir = Path(subdir).as_posix().lstrip("/")
+                target_dir = UPLOAD_DIR / safe_subdir
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            # 元ファイル名（ベース名のみ・Unicode保持）
+            base = _safe_basename(f.filename)
+            # ユニーク化
+            save_path = _unique_path(target_dir, base)
+            f.save(save_path)
+
+            rel = save_path.relative_to(UPLOAD_DIR).as_posix()
+            view_link = url_for('view_excel', filename=rel)
+            msg = f"アップロード完了：<a href='{view_link}'>{rel}</a> を表示"
+
+        # GETにリダイレクトしてF5の二重送信を防止
+        return redirect(url_for("index", msg=msg))
+
+    # GET
     files = _iter_excels()
-    return render_template_string(INDEX_HTML, files=files)
+    return render_template_string(
+        INDEX_HTML,
+        files=files,
+        msg=request.args.get("msg", ""),
+        max_mb=int(app.config["MAX_CONTENT_LENGTH"] / (1024*1024))
+    )
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
 
 
