@@ -15,23 +15,25 @@ libreoffice --headless --convert-to pdf --outdir ./out ./uploads/売上.xlsx
 from flask import Flask, render_template_string, send_file, abort, request, redirect, url_for
 import subprocess, tempfile, shutil
 from pathlib import Path
-from datetime import datetime
+from werkzeug.exceptions import NotFound
 
 app = Flask(__name__)
 
-# 設定
+# ===== 設定 =====
 UPLOAD_DIR = Path("uploads")      # Excel置き場
-CACHE_DIR  = Path("out")          # 生成PDF置き場
-CACHE_DIR.mkdir(exist_ok=True, parents=True)
-UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
+CACHE_DIR  = Path("out")          # 生成PDF置き場（サブフォルダも自動作成）
 ALLOWED_EXTS = {".xlsx", ".xlsm", ".xls"}
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB 上限（必要に応じて調整）
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
 
+UPLOAD_DIR.mkdir(exist_ok=True, parents=True)
+CACHE_DIR.mkdir(exist_ok=True, parents=True)
+
+# ===== ユーティリティ =====
 def _is_allowed(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXTS
 
 def _safe_basename(filename: str) -> str:
-    # パス区切りを除去してベース名のみ（Unicodeは保持）
+    # パス区切り除去（Unicode保持）
     return Path(filename).name
 
 def _unique_path(base_dir: Path, name: str) -> Path:
@@ -47,63 +49,86 @@ def _unique_path(base_dir: Path, name: str) -> Path:
             return cand
         i += 1
 
-def convert_xlsx_to_pdf(xls_path: Path, pdf_path: Path):
-    if not xls_path.exists():
+def _resolve_under(root: Path, target: Path) -> Path:
+    """root 配下かどうか検証しつつ絶対パス化"""
+    root = root.resolve()
+    abs_target = (root / target).resolve()
+    if not str(abs_target).startswith(str(root)):
+        raise NotFound()
+    return abs_target
+
+def _pdf_path_for(xls_abs: Path) -> Path:
+    """UPLOAD_DIR配下の相対パス構造を保ったまま、out/ に .pdf を作る"""
+    rel = xls_abs.relative_to(UPLOAD_DIR.resolve())
+    pdf_abs = (CACHE_DIR / rel).with_suffix(".pdf")
+    pdf_abs.parent.mkdir(parents=True, exist_ok=True)
+    return pdf_abs
+
+# ===== 変換 =====
+def convert_xlsx_to_pdf(xls_abs: Path, pdf_abs: Path):
+    if not xls_abs.exists():
         abort(404, "Excelが見つかりません")
     # 既にPDFがあり新しければ再変換しない
-    if pdf_path.exists() and pdf_path.stat().st_mtime >= xls_path.stat().st_mtime:
+    if pdf_abs.exists() and pdf_abs.stat().st_mtime >= xls_abs.stat().st_mtime:
         return
-    # リクエストごとに一時プロファイル→並列変換のロック競合回避
+    # 並列時のロック競合回避（ユーザープロファイルを一時領域に分離）
     tmp_profile = Path(tempfile.mkdtemp(prefix="lo-profile-"))
     try:
         cmd = [
             "libreoffice", "--headless",
             f"-env:UserInstallation=file://{tmp_profile.as_posix()}",
             "--convert-to", "pdf:calc_pdf_Export",
-            "--outdir", str(CACHE_DIR), str(xls_path),
+            "--outdir", str(pdf_abs.parent),
+            str(xls_abs),
         ]
         subprocess.run(cmd, check=True, timeout=180)
-        if not pdf_path.exists():
+        if not pdf_abs.exists():
             abort(500, "PDF生成に失敗しました")
     finally:
         shutil.rmtree(tmp_profile, ignore_errors=True)
 
-# ====== 表示系 ======
-
-# PDFそのものを返す（iframeの中身）
+# ===== 表示（PDF本体） =====
 @app.route("/excel-pdf/<path:filename>")
 def excel_pdf(filename):
-    xls = UPLOAD_DIR / filename
-    pdf = CACHE_DIR / (Path(filename).stem + ".pdf")
-    convert_xlsx_to_pdf(xls, pdf)
+    # uploads 配下に限定
+    xls_abs = _resolve_under(UPLOAD_DIR, Path(filename))
+    if not xls_abs.exists() or not _is_allowed(xls_abs.name):
+        raise NotFound()
+
+    pdf_abs = _pdf_path_for(xls_abs)
+    convert_xlsx_to_pdf(xls_abs, pdf_abs)
+
     return send_file(
-        pdf,
+        pdf_abs,
         mimetype="application/pdf",
         as_attachment=False,
-        download_name=pdf.name,  # 表示名
-        max_age=0,               # 必要に応じてキャッシュ調整
+        download_name=pdf_abs.name,
+        max_age=0,
         conditional=True,
         etag=True,
-        last_modified=pdf.stat().st_mtime
+        last_modified=pdf_abs.stat().st_mtime
     )
 
-# 表示用ページ（ここをユーザーに見せる）
+# ===== ビューページ（iframeでPDFを表示） =====
 PAGE = """
 <!doctype html><meta charset="utf-8">
 <title>{{ title }}</title>
-<style>body{margin:0} .v{width:100vw;height:100vh;border:0}</style>
-<iframe class="v" src="{{ src }}" allowfullscreen></iframe>
+<style>
+  body{margin:0}
+  .v{width:100vw;height:100vh;border:0}
+</style>
+<iframe class="v" src="{{ url_for('excel_pdf', filename=filename) }}" allowfullscreen></iframe>
 """
+
 @app.route("/view/<path:filename>")
 def view_excel(filename):
     return render_template_string(
         PAGE,
         title=f"{filename} の表示",
-        src=f"/excel-pdf/{filename}"
+        filename=filename  # ← テンプレ側で url_for に渡す
     )
 
-# ====== アップロード + 一覧 ======
-
+# ===== 一覧 + アップロード =====
 INDEX_HTML = """
 <!doctype html><meta charset="utf-8">
 <title>Excel 一覧とアップロード</title>
@@ -180,17 +205,14 @@ def index():
         elif not _is_allowed(f.filename):
             msg = "対応していない拡張子です。(.xlsx / .xlsm / .xls のみ)"
         else:
-            # 保存先ディレクトリ
+            # 保存先ディレクトリ（サブフォルダは安全化＆作成）
             target_dir = UPLOAD_DIR
             if subdir:
-                # サブフォルダの安全化（パストラバーサル対策）
                 safe_subdir = Path(subdir).as_posix().lstrip("/")
-                target_dir = UPLOAD_DIR / safe_subdir
-            target_dir.mkdir(parents=True, exist_ok=True)
+                target_dir = _resolve_under(UPLOAD_DIR, Path(safe_subdir))
+                target_dir.mkdir(parents=True, exist_ok=True)
 
-            # 元ファイル名（ベース名のみ・Unicode保持）
             base = _safe_basename(f.filename)
-            # ユニーク化
             save_path = _unique_path(target_dir, base)
             f.save(save_path)
 
@@ -198,10 +220,9 @@ def index():
             view_link = url_for('view_excel', filename=rel)
             msg = f"アップロード完了：<a href='{view_link}'>{rel}</a> を表示"
 
-        # GETにリダイレクトしてF5の二重送信を防止
+        # PRGパターンでリロードの二重送信を防止
         return redirect(url_for("index", msg=msg))
 
-    # GET
     files = _iter_excels()
     return render_template_string(
         INDEX_HTML,
@@ -212,6 +233,7 @@ def index():
 
 if __name__ == "__main__":
     app.run(debug=True)
+
 
 
 
