@@ -11,6 +11,209 @@ libreoffice --headless --convert-to pdf --outdir ./out ./uploads/売上.xlsx
 
 ---------------------------------------------------------------------------------------------------------
 
+# 先頭の import 群に追加（未追加なら）
+from flask import url_for
+
+# --- PDF.js を使った最小UI（白ベース・ページ送り + ズーム + ページ番号） ---
+PDFJS_PAGE = """
+<!doctype html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ filename }} | PDFビュー</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#666; --border:#e5e7eb; }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);
+             font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Noto Sans JP',sans-serif}
+  header{position:sticky;top:0;background:#fff;border-bottom:1px solid var(--border);
+         padding:10px 12px;display:flex;gap:10px;align-items:center}
+  .title{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+         font-size:14px;color:var(--muted)}
+  .btn{appearance:none;border:1px solid var(--border);background:#fff;border-radius:8px;
+       padding:8px 12px;cursor:pointer}
+  .btn[disabled]{opacity:.4;cursor:not-allowed}
+  .counter{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .counter input{width:64px;padding:6px;border:1px solid var(--border);border-radius:8px}
+  .zoom{display:flex;align-items:center;gap:8px}
+  .zoom .level{min-width:48px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+  main{display:flex;justify-content:center;align-items:flex-start;padding:16px}
+  canvas{box-shadow:0 1px 6px rgba(0,0,0,.06);background:#fff;max-width:100%}
+  .grow{flex:1}
+  .open-tab{margin-left:4px;font-size:12px;color:#2563eb;text-decoration:none}
+</style>
+</head><body>
+
+<header>
+  <div class="title">{{ filename }}</div>
+
+  <!-- ページ送り -->
+  <button id="prev" class="btn" aria-label="前のページ">◀</button>
+  <div class="counter">
+    <input id="page_input" type="number" min="1" value="1" aria-label="ページ番号">
+    <span>/ <span id="page_count">?</span></span>
+  </div>
+  <button id="next" class="btn" aria-label="次のページ">▶</button>
+
+  <!-- ズーム -->
+  <div class="zoom">
+    <button id="zoom_out" class="btn" aria-label="ズームアウト">−</button>
+    <div class="level" id="zoom_level">100%</div>
+    <button id="zoom_in" class="btn" aria-label="ズームイン">＋</button>
+  </div>
+
+  <div class="grow"></div>
+  <!-- 別タブで開く（同じPDF.jsビューを別タブで） -->
+  <a class="open-tab" href="{{ url_for('pdfjs_view', filename=filename) }}" target="_blank" rel="noopener">別タブで開く↗</a>
+</header>
+
+<main><canvas id="the-canvas"></canvas></main>
+
+<!-- PDF.js（CDN） -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
+        integrity="sha512-PY4cJ0oI5J4oBVBR3mwb4F+T9qT8t2gE0y3o9J5oXQq2eB2m9m6sD6V5t7kG0T3g0yJpXz0i1r3q6a4f8b0l6A=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>
+  // ワーカーの場所（CDN）
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+  const url = {{ pdf_url|tojson }};
+  const canvas = document.getElementById('the-canvas');
+  const ctx = canvas.getContext('2d');
+  const pageInput = document.getElementById('page_input');
+  const pageCountSpan = document.getElementById('page_count');
+  const btnPrev = document.getElementById('prev');
+  const btnNext = document.getElementById('next');
+  const btnZoomIn = document.getElementById('zoom_in');
+  const btnZoomOut = document.getElementById('zoom_out');
+  const zoomLevel = document.getElementById('zoom_level');
+
+  let pdfDoc = null;
+  let pageNum = 1;
+
+  // ズーム制御：画面サイズにフィットする基準倍率 × 追加倍率（ユーザー操作）
+  let baseScale = 1;     // ウィンドウに応じて計算
+  let userScale = 1;     // ユーザーが変更（0.5〜3.0）
+  const USER_MIN = 0.5, USER_MAX = 3.0, USER_STEP = 0.1;
+
+  function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
+
+  function updateZoomLabel() {
+    zoomLevel.textContent = Math.round(userScale * 100) + "%";
+  }
+
+  function computeBaseScale(page) {
+    const viewport = page.getViewport({ scale: 1 });
+    const maxWidth = Math.min(window.innerWidth - 32, 1400); // 上限幅
+    let scale = maxWidth / viewport.width;
+    // 高さが収まり切らない場合は少し縮小
+    if (viewport.height * scale > window.innerHeight * 0.9) {
+      scale = (window.innerHeight * 0.9) / viewport.height;
+    }
+    return scale;
+  }
+
+  let isRendering = false;
+  let pendingPage = null;
+
+  function renderPage(num) {
+    isRendering = true;
+    pdfDoc.getPage(num).then(function(page) {
+      // リサイズで baseScale を再計算（ページごとにサイズ差があっても自然に合わせる）
+      baseScale = computeBaseScale(page);
+      const scale = baseScale * userScale;
+      const viewport = page.getViewport({ scale });
+
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+
+      const renderTask = page.render({ canvasContext: ctx, viewport });
+      renderTask.promise.then(function () {
+        isRendering = false;
+        pageInput.value = num;
+        btnPrev.disabled = (num <= 1);
+        btnNext.disabled = (num >= pdfDoc.numPages);
+        if (pendingPage !== null) {
+          const n = pendingPage; pendingPage = null;
+          renderPage(n);
+        }
+      });
+    });
+  }
+
+  function queueRenderPage(num) {
+    if (isRendering) pendingPage = num;
+    else renderPage(num);
+  }
+
+  function gotoPage(n) {
+    n = clamp(n|0, 1, pdfDoc.numPages);
+    if (n === pageNum) return;
+    pageNum = n;
+    queueRenderPage(pageNum);
+  }
+
+  // イベント
+  btnPrev.addEventListener('click', () => gotoPage(pageNum - 1));
+  btnNext.addEventListener('click', () => gotoPage(pageNum + 1));
+  pageInput.addEventListener('change', () => gotoPage(parseInt(pageInput.value || "1", 10)));
+  pageInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') gotoPage(parseInt(pageInput.value || "1", 10));
+  });
+
+  btnZoomIn.addEventListener('click', () => {
+    userScale = clamp((userScale + USER_STEP), USER_MIN, USER_MAX);
+    updateZoomLabel();
+    queueRenderPage(pageNum);
+  });
+  btnZoomOut.addEventListener('click', () => {
+    userScale = clamp((userScale - USER_STEP), USER_MIN, USER_MAX);
+    updateZoomLabel();
+    queueRenderPage(pageNum);
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') gotoPage(pageNum - 1);
+    if (e.key === 'ArrowRight') gotoPage(pageNum + 1);
+    if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+')) { // Ctrl/Cmd + +
+      e.preventDefault(); userScale = clamp(userScale + USER_STEP, USER_MIN, USER_MAX);
+      updateZoomLabel(); queueRenderPage(pageNum);
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === '-')) { // Ctrl/Cmd + -
+      e.preventDefault(); userScale = clamp(userScale - USER_STEP, USER_MIN, USER_MAX);
+      updateZoomLabel(); queueRenderPage(pageNum);
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === '0')) { // Ctrl/Cmd + 0 リセット
+      e.preventDefault(); userScale = 1; updateZoomLabel(); queueRenderPage(pageNum);
+    }
+  });
+
+  window.addEventListener('resize', () => queueRenderPage(pageNum));
+
+  // 読み込み
+  pdfjsLib.getDocument(url).promise.then(function(pdf) {
+    pdfDoc = pdf;
+    pageCountSpan.textContent = pdf.numPages;
+    updateZoomLabel();
+    // 初期表示
+    pageNum = 1;
+    renderPage(pageNum);
+  }).catch(err => {
+    alert("PDFの読み込みに失敗しました:\\n" + err.message);
+  });
+</script>
+</body></html>
+"""
+
+@app.route("/pdfjs/<path:filename>")
+def pdfjs_view(filename):
+    # ここでは PDF データ自体は返さず、ビューだけ返す
+    return render_template_string(
+        PDFJS_PAGE,
+        filename=filename,
+        pdf_url=url_for('excel_pdf', filename=filename)  # 既存のPDF配信エンドポイント
+    )
+
+
 # app.py
 from flask import Flask, render_template_string, send_file, abort, request, redirect, url_for
 import subprocess, tempfile, shutil
