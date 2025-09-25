@@ -10,75 +10,6 @@ libreoffice --headless --convert-to pdf --outdir ./out ./uploads/売上.xlsx
 # → ./out/売上.pdf ができればOK
 
 
-# app.py
-# app.py
-from flask import Flask, render_template_string, send_file, abort
-import subprocess, tempfile, shutil
-from pathlib import Path
-
-app = Flask(__name__)
-UPLOAD_DIR = Path("uploads")      # Excel置き場
-CACHE_DIR  = Path("out")          # 生成PDF置き場
-CACHE_DIR.mkdir(exist_ok=True)
-
-def convert_xlsx_to_pdf(xls_path: Path, pdf_path: Path):
-    if not xls_path.exists():
-        abort(404, "Excelが見つかりません")
-    # 既にPDFがあり新しければ再変換しない
-    if pdf_path.exists() and pdf_path.stat().st_mtime >= xls_path.stat().st_mtime:
-        return
-    # リクエストごとに一時プロファイル→並列変換のロック回避
-    tmp_profile = Path(tempfile.mkdtemp(prefix="lo-profile-"))
-    try:
-        cmd = [
-            "libreoffice", "--headless",
-            f"-env:UserInstallation=file://{tmp_profile.as_posix()}",
-            "--convert-to", "pdf:calc_pdf_Export",
-            "--outdir", str(CACHE_DIR), str(xls_path),
-        ]
-        subprocess.run(cmd, check=True, timeout=180)
-        if not pdf_path.exists():
-            abort(500, "PDF生成に失敗しました")
-    finally:
-        shutil.rmtree(tmp_profile, ignore_errors=True)
-
-# ① PDFそのものを返す（iframeの中身）
-@app.route("/excel-pdf/<path:filename>")
-def excel_pdf(filename):
-    xls = UPLOAD_DIR / filename
-    pdf = CACHE_DIR / (Path(filename).stem + ".pdf")
-    convert_xlsx_to_pdf(xls, pdf)
-    # as_attachment=False で「ダウンロードではなく閲覧（inline）」を指示
-    return send_file(
-        pdf,
-        mimetype="application/pdf",
-        as_attachment=False,
-        download_name=pdf.name,  # 表示名
-        max_age=0,               # 必要に応じてキャッシュ調整
-        conditional=True,
-        etag=True,
-        last_modified=pdf.stat().st_mtime
-    )
-
-# ② 表示用ページ（ここをユーザーに見せる）
-PAGE = """
-<!doctype html><meta charset="utf-8">
-<title>{{ title }}</title>
-<style>body{margin:0} .v{width:100vw;height:100vh;border:0}</style>
-<iframe class="v" src="{{ src }}" allowfullscreen></iframe>
-"""
-@app.route("/view/<path:filename>")
-def view_excel(filename):
-    return render_template_string(
-        PAGE,
-        title=f"{filename} の表示",
-        src=f"/excel-pdf/{filename}"
-    )
-
-if __name__ == "__main__":
-    app.run(debug=True)
-
-
 # 既存の import 群に追加
 from flask import url_for
 
@@ -125,4 +56,5 @@ def _iter_excels():
 def index():
     files = _iter_excels()
     return render_template_string(INDEX_HTML, files=files)
+
 
