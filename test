@@ -10,12 +10,14 @@ libreoffice --headless --convert-to pdf --outdir ./out ./uploads/売上.xlsx
 # → ./out/売上.pdf ができればOK
 
 ---------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------
 
 # 先頭の import 群に追加（未追加なら）
-from flask import url_for
+from flask import url_for, render_template_string
 
-# --- PDF.js を使った最小UI（白ベース・ページ送り + ズーム + ページ番号） ---
-PDFJS_PAGE = """
+# --- PDF.js(ESM) 版：白ベース／ページ送り＋ズーム＋ページ番号のみ ---
+PDFJS_PAGE_MJS = """
 <!doctype html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -32,9 +34,9 @@ PDFJS_PAGE = """
        padding:8px 12px;cursor:pointer}
   .btn[disabled]{opacity:.4;cursor:not-allowed}
   .counter{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}
-  .counter input{width:64px;padding:6px;border:1px solid var(--border);border-radius:8px}
+  .counter input{width:72px;padding:6px;border:1px solid var(--border);border-radius:8px}
   .zoom{display:flex;align-items:center;gap:8px}
-  .zoom .level{min-width:48px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+  .zoom .level{min-width:56px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
   main{display:flex;justify-content:center;align-items:flex-start;padding:16px}
   canvas{box-shadow:0 1px 6px rgba(0,0,0,.06);background:#fff;max-width:100%}
   .grow{flex:1}
@@ -61,22 +63,18 @@ PDFJS_PAGE = """
   </div>
 
   <div class="grow"></div>
-  <!-- 別タブで開く（同じPDF.jsビューを別タブで） -->
-  <a class="open-tab" href="{{ url_for('pdfjs_view', filename=filename) }}" target="_blank" rel="noopener">別タブで開く↗</a>
+  <a class="open-tab" href="{{ url_for('pdfjs_view_mjs', filename=filename) }}" target="_blank" rel="noopener">別タブで開く↗</a>
 </header>
 
 <main><canvas id="the-canvas"></canvas></main>
 
-<!-- PDF.js（CDN） -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"
-        integrity="sha512-PY4cJ0oI5J4oBVBR3mwb4F+T9qT8t2gE0y3o9J5oXQq2eB2m9m6sD6V5t7kG0T3g0yJpXz0i1r3q6a4f8b0l6A=="
-        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-<script>
-  // ワーカーの場所（CDN）
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+<!-- ESM 版 PDF.js をローカルから読み込み -->
+<script type="module">
+  import * as pdfjsLib from "{{ url_for('static', filename='pdfjs/pdf.mjs') }}";
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "{{ url_for('static', filename='pdfjs/pdf.worker.mjs') }}";
 
   const url = {{ pdf_url|tojson }};
+
   const canvas = document.getElementById('the-canvas');
   const ctx = canvas.getContext('2d');
   const pageInput = document.getElementById('page_input');
@@ -90,22 +88,18 @@ PDFJS_PAGE = """
   let pdfDoc = null;
   let pageNum = 1;
 
-  // ズーム制御：画面サイズにフィットする基準倍率 × 追加倍率（ユーザー操作）
-  let baseScale = 1;     // ウィンドウに応じて計算
-  let userScale = 1;     // ユーザーが変更（0.5〜3.0）
+  // ズーム制御：画面フィット倍率 * ユーザー倍率
+  let baseScale = 1;     // 画面サイズから算出
+  let userScale = 1;     // 0.5〜3.0
   const USER_MIN = 0.5, USER_MAX = 3.0, USER_STEP = 0.1;
 
-  function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
-
-  function updateZoomLabel() {
-    zoomLevel.textContent = Math.round(userScale * 100) + "%";
-  }
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  const updateZoomLabel = () => { zoomLevel.textContent = Math.round(userScale * 100) + "%"; };
 
   function computeBaseScale(page) {
     const viewport = page.getViewport({ scale: 1 });
-    const maxWidth = Math.min(window.innerWidth - 32, 1400); // 上限幅
+    const maxWidth = Math.min(window.innerWidth - 32, 1400); // ページの最大幅
     let scale = maxWidth / viewport.width;
-    // 高さが収まり切らない場合は少し縮小
     if (viewport.height * scale > window.innerHeight * 0.9) {
       scale = (window.innerHeight * 0.9) / viewport.height;
     }
@@ -117,8 +111,7 @@ PDFJS_PAGE = """
 
   function renderPage(num) {
     isRendering = true;
-    pdfDoc.getPage(num).then(function(page) {
-      // リサイズで baseScale を再計算（ページごとにサイズ差があっても自然に合わせる）
+    pdfDoc.getPage(num).then(page => {
       baseScale = computeBaseScale(page);
       const scale = baseScale * userScale;
       const viewport = page.getViewport({ scale });
@@ -126,17 +119,16 @@ PDFJS_PAGE = """
       canvas.height = viewport.height;
       canvas.width = viewport.width;
 
-      const renderTask = page.render({ canvasContext: ctx, viewport });
-      renderTask.promise.then(function () {
-        isRendering = false;
-        pageInput.value = num;
-        btnPrev.disabled = (num <= 1);
-        btnNext.disabled = (num >= pdfDoc.numPages);
-        if (pendingPage !== null) {
-          const n = pendingPage; pendingPage = null;
-          renderPage(n);
-        }
-      });
+      return page.render({ canvasContext: ctx, viewport }).promise;
+    }).then(() => {
+      isRendering = false;
+      pageInput.value = num;
+      btnPrev.disabled = (num <= 1);
+      btnNext.disabled = (num >= pdfDoc.numPages);
+      if (pendingPage !== null) {
+        const n = pendingPage; pendingPage = null;
+        renderPage(n);
+      }
     });
   }
 
@@ -156,45 +148,26 @@ PDFJS_PAGE = """
   btnPrev.addEventListener('click', () => gotoPage(pageNum - 1));
   btnNext.addEventListener('click', () => gotoPage(pageNum + 1));
   pageInput.addEventListener('change', () => gotoPage(parseInt(pageInput.value || "1", 10)));
-  pageInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') gotoPage(parseInt(pageInput.value || "1", 10));
-  });
+  pageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') gotoPage(parseInt(pageInput.value || "1", 10)); });
 
-  btnZoomIn.addEventListener('click', () => {
-    userScale = clamp((userScale + USER_STEP), USER_MIN, USER_MAX);
-    updateZoomLabel();
-    queueRenderPage(pageNum);
-  });
-  btnZoomOut.addEventListener('click', () => {
-    userScale = clamp((userScale - USER_STEP), USER_MIN, USER_MAX);
-    updateZoomLabel();
-    queueRenderPage(pageNum);
-  });
+  btnZoomIn.addEventListener('click', () => { userScale = clamp(userScale + USER_STEP, USER_MIN, USER_MAX); updateZoomLabel(); queueRenderPage(pageNum); });
+  btnZoomOut.addEventListener('click', () => { userScale = clamp(userScale - USER_STEP, USER_MIN, USER_MAX); updateZoomLabel(); queueRenderPage(pageNum); });
 
   window.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowLeft') gotoPage(pageNum - 1);
     if (e.key === 'ArrowRight') gotoPage(pageNum + 1);
-    if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+')) { // Ctrl/Cmd + +
-      e.preventDefault(); userScale = clamp(userScale + USER_STEP, USER_MIN, USER_MAX);
-      updateZoomLabel(); queueRenderPage(pageNum);
-    }
-    if ((e.ctrlKey || e.metaKey) && (e.key === '-')) { // Ctrl/Cmd + -
-      e.preventDefault(); userScale = clamp(userScale - USER_STEP, USER_MIN, USER_MAX);
-      updateZoomLabel(); queueRenderPage(pageNum);
-    }
-    if ((e.ctrlKey || e.metaKey) && (e.key === '0')) { // Ctrl/Cmd + 0 リセット
-      e.preventDefault(); userScale = 1; updateZoomLabel(); queueRenderPage(pageNum);
-    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+')) { e.preventDefault(); userScale = clamp(userScale + USER_STEP, USER_MIN, USER_MAX); updateZoomLabel(); queueRenderPage(pageNum); }
+    if ((e.ctrlKey || e.metaKey) && (e.key === '-')) { e.preventDefault(); userScale = clamp(userScale - USER_STEP, USER_MIN, USER_MAX); updateZoomLabel(); queueRenderPage(pageNum); }
+    if ((e.ctrlKey || e.metaKey) && (e.key === '0')) { e.preventDefault(); userScale = 1; updateZoomLabel(); queueRenderPage(pageNum); }
   });
 
   window.addEventListener('resize', () => queueRenderPage(pageNum));
 
   // 読み込み
-  pdfjsLib.getDocument(url).promise.then(function(pdf) {
+  pdfjsLib.getDocument(url).promise.then(pdf => {
     pdfDoc = pdf;
     pageCountSpan.textContent = pdf.numPages;
     updateZoomLabel();
-    // 初期表示
     pageNum = 1;
     renderPage(pageNum);
   }).catch(err => {
@@ -205,13 +178,18 @@ PDFJS_PAGE = """
 """
 
 @app.route("/pdfjs/<path:filename>")
-def pdfjs_view(filename):
-    # ここでは PDF データ自体は返さず、ビューだけ返す
+def pdfjs_view_mjs(filename):
+    # ここではビューのみ提供し、PDFバイナリは既存の /excel-pdf/<filename> から取得します
     return render_template_string(
-        PDFJS_PAGE,
+        PDFJS_PAGE_MJS,
         filename=filename,
-        pdf_url=url_for('excel_pdf', filename=filename)  # 既存のPDF配信エンドポイント
+        pdf_url=url_for('excel_pdf', filename=filename)
     )
+
+
+
+---------------------------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------------------------
 
 
 # app.py
