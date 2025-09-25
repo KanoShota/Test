@@ -439,5 +439,62 @@ if __name__ == "__main__":
     app.run(debug=True)
 
 
+-----------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------
+
+# HTML変換用ディレクトリ
+HTML_DIR = Path("out_html")
+HTML_DIR.mkdir(exist_ok=True)
+
+def convert_xlsx_to_html(xls_path: Path, html_path: Path):
+    if not xls_path.exists():
+        abort(404, "Excelが見つかりません")
+    if html_path.exists() and html_path.stat().st_mtime >= xls_path.stat().st_mtime:
+        return
+    tmp_profile = Path(tempfile.mkdtemp(prefix="lo-profile-"))
+    try:
+        cmd = [
+            "libreoffice", "--headless",
+            f"-env:UserInstallation=file://{tmp_profile.as_posix()}",
+            "--convert-to", "html:XHTML Writer File:UTF8",
+            "--outdir", str(html_path.parent), str(xls_path),
+        ]
+        subprocess.run(cmd, check=True, timeout=180)
+        if not html_path.exists():
+            abort(500, "HTML生成に失敗しました")
+    finally:
+        shutil.rmtree(tmp_profile, ignore_errors=True)
+
+# ① HTMLそのものを返す
+@app.route("/excel-html/<path:filename>")
+def excel_html(filename):
+    xls = _resolve_under(UPLOAD_DIR, Path(filename))
+    html = HTML_DIR / (Path(filename).stem + ".html")
+    convert_xlsx_to_html(xls, html)
+    return send_file(
+        html,
+        mimetype="text/html",
+        as_attachment=False,
+        download_name=html.name
+    )
+
+# ② HTMLをiframeで表示するページ
+HTML_PAGE = """
+<!doctype html><meta charset="utf-8">
+<title>{{ title }}</title>
+<style>
+  body{margin:0}
+  iframe{width:100vw;height:100vh;border:0}
+</style>
+<iframe src="{{ src }}"></iframe>
+"""
+
+@app.route("/view-html/<path:filename>")
+def view_excel_html(filename):
+    return render_template_string(
+        HTML_PAGE,
+        title=f"{filename} のHTML表示",
+        src=url_for('excel_html', filename=filename)
+    )
 
 
