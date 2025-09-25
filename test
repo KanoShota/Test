@@ -13,24 +13,23 @@ libreoffice --headless --convert-to pdf --outdir ./out ./uploads/売上.xlsx
 ---------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------
 
-# 先頭の import 群に追加（未追加なら）
 from flask import url_for, render_template_string
+from pathlib import Path
 
-# --- PDF.js(ESM) 版：白ベース／ページ送り＋ズーム＋ページ番号のみ ---
-PDFJS_PAGE_MJS = """
+PDFJS_PAGE_CDN = """
 <!doctype html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{ filename }} | PDFビュー</title>
 <style>
-  :root { --bg:#fff; --fg:#111; --muted:#666; --border:#e5e7eb; }
+  :root { --bg:#f3f4f6; --panel:#fff; --fg:#111; --muted:#666; --border:#e5e7eb; }
   html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);
              font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Noto Sans JP',sans-serif}
-  header{position:sticky;top:0;background:#fff;border-bottom:1px solid var(--border);
+  header{position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--border);
          padding:10px 12px;display:flex;gap:10px;align-items:center}
   .title{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
          font-size:14px;color:var(--muted)}
-  .btn{appearance:none;border:1px solid var(--border);background:#fff;border-radius:8px;
+  .btn{appearance:none;border:1px solid var(--border);background:var(--panel);border-radius:8px;
        padding:8px 12px;cursor:pointer}
   .btn[disabled]{opacity:.4;cursor:not-allowed}
   .counter{font-size:13px;color:var(--muted);display:flex;align-items:center;gap:6px}
@@ -41,10 +40,12 @@ PDFJS_PAGE_MJS = """
   canvas{box-shadow:0 1px 6px rgba(0,0,0,.06);background:#fff;max-width:100%}
   .grow{flex:1}
   .open-tab{margin-left:4px;font-size:12px;color:#2563eb;text-decoration:none}
+  .logo{width:22px;height:22px;object-fit:contain}
 </style>
 </head><body>
 
 <header>
+  {% if icon_url %}<img class="logo" src="{{ icon_url }}" alt="logo">{% endif %}
   <div class="title">{{ filename }}</div>
 
   <!-- ページ送り -->
@@ -63,18 +64,18 @@ PDFJS_PAGE_MJS = """
   </div>
 
   <div class="grow"></div>
-  <a class="open-tab" href="{{ url_for('pdfjs_view_mjs', filename=filename) }}" target="_blank" rel="noopener">別タブで開く↗</a>
+  <a class="open-tab" href="{{ url_for('pdfjs_view_cdn', filename=filename) }}" target="_blank" rel="noopener">別タブで開く↗</a>
 </header>
 
 <main><canvas id="the-canvas"></canvas></main>
 
-<!-- ESM 版 PDF.js をローカルから読み込み -->
+<!-- PDF.js (ESM, CDN) -->
 <script type="module">
-  import * as pdfjsLib from "{{ url_for('static', filename='pdfjs/pdf.mjs') }}";
-  pdfjsLib.GlobalWorkerOptions.workerSrc = "{{ url_for('static', filename='pdfjs/pdf.worker.mjs') }}";
+  import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/5.4.54/pdf.min.mjs";
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/5.4.54/pdf.worker.min.mjs";
 
   const url = {{ pdf_url|tojson }};
-
   const canvas = document.getElementById('the-canvas');
   const ctx = canvas.getContext('2d');
   const pageInput = document.getElementById('page_input');
@@ -87,10 +88,8 @@ PDFJS_PAGE_MJS = """
 
   let pdfDoc = null;
   let pageNum = 1;
-
-  // ズーム制御：画面フィット倍率 * ユーザー倍率
-  let baseScale = 1;     // 画面サイズから算出
-  let userScale = 1;     // 0.5〜3.0
+  let baseScale = 1;
+  let userScale = 1;
   const USER_MIN = 0.5, USER_MAX = 3.0, USER_STEP = 0.1;
 
   const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
@@ -98,7 +97,7 @@ PDFJS_PAGE_MJS = """
 
   function computeBaseScale(page) {
     const viewport = page.getViewport({ scale: 1 });
-    const maxWidth = Math.min(window.innerWidth - 32, 1400); // ページの最大幅
+    const maxWidth = Math.min(window.innerWidth - 32, 1400);
     let scale = maxWidth / viewport.width;
     if (viewport.height * scale > window.innerHeight * 0.9) {
       scale = (window.innerHeight * 0.9) / viewport.height;
@@ -115,36 +114,25 @@ PDFJS_PAGE_MJS = """
       baseScale = computeBaseScale(page);
       const scale = baseScale * userScale;
       const viewport = page.getViewport({ scale });
-
       canvas.height = viewport.height;
       canvas.width = viewport.width;
-
       return page.render({ canvasContext: ctx, viewport }).promise;
     }).then(() => {
       isRendering = false;
       pageInput.value = num;
       btnPrev.disabled = (num <= 1);
       btnNext.disabled = (num >= pdfDoc.numPages);
-      if (pendingPage !== null) {
-        const n = pendingPage; pendingPage = null;
-        renderPage(n);
-      }
+      if (pendingPage !== null) { const n = pendingPage; pendingPage = null; renderPage(n); }
     });
   }
-
-  function queueRenderPage(num) {
-    if (isRendering) pendingPage = num;
-    else renderPage(num);
-  }
-
+  function queueRenderPage(num) { if (isRendering) pendingPage = num; else renderPage(num); }
   function gotoPage(n) {
     n = clamp(n|0, 1, pdfDoc.numPages);
     if (n === pageNum) return;
-    pageNum = n;
-    queueRenderPage(pageNum);
+    pageNum = n; queueRenderPage(pageNum);
   }
 
-  // イベント
+  // UIイベント
   btnPrev.addEventListener('click', () => gotoPage(pageNum - 1));
   btnNext.addEventListener('click', () => gotoPage(pageNum + 1));
   pageInput.addEventListener('change', () => gotoPage(parseInt(pageInput.value || "1", 10)));
@@ -153,6 +141,7 @@ PDFJS_PAGE_MJS = """
   btnZoomIn.addEventListener('click', () => { userScale = clamp(userScale + USER_STEP, USER_MIN, USER_MAX); updateZoomLabel(); queueRenderPage(pageNum); });
   btnZoomOut.addEventListener('click', () => { userScale = clamp(userScale - USER_STEP, USER_MIN, USER_MAX); updateZoomLabel(); queueRenderPage(pageNum); });
 
+  // キーボード
   window.addEventListener('keydown', (e) => {
     if (e.key === 'ArrowLeft') gotoPage(pageNum - 1);
     if (e.key === 'ArrowRight') gotoPage(pageNum + 1);
@@ -160,6 +149,34 @@ PDFJS_PAGE_MJS = """
     if ((e.ctrlKey || e.metaKey) && (e.key === '-')) { e.preventDefault(); userScale = clamp(userScale - USER_STEP, USER_MIN, USER_MAX); updateZoomLabel(); queueRenderPage(pageNum); }
     if ((e.ctrlKey || e.metaKey) && (e.key === '0')) { e.preventDefault(); userScale = 1; updateZoomLabel(); queueRenderPage(pageNum); }
   });
+
+  // ホイール操作
+  let wheelLock = false; // スクロール連打の暴発抑制
+  function throttleWheel(fn) {
+    if (wheelLock) return;
+    wheelLock = true; fn();
+    setTimeout(() => wheelLock = false, 120);
+  }
+  window.addEventListener('wheel', (e) => {
+    // Ctrl + スクロール → ズーム
+    if (e.ctrlKey) {
+      e.preventDefault();
+      const dir = e.deltaY > 0 ? -1 : 1; // 下で縮小、上で拡大
+      throttleWheel(() => {
+        userScale = clamp(userScale + dir * USER_STEP, USER_MIN, USER_MAX);
+        updateZoomLabel(); queueRenderPage(pageNum);
+      });
+      return;
+    }
+    // 通常スクロール → ページ送り
+    // 縦スクロール量で前後、水平スクロールは無視
+    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+      throttleWheel(() => {
+        if (e.deltaY > 0) gotoPage(pageNum + 1);
+        else gotoPage(pageNum - 1);
+      });
+    }
+  }, { passive: false });
 
   window.addEventListener('resize', () => queueRenderPage(pageNum));
 
@@ -178,15 +195,21 @@ PDFJS_PAGE_MJS = """
 """
 
 @app.route("/pdfjs/<path:filename>")
-def pdfjs_view_mjs(filename):
-    # ここではビューのみ提供し、PDFバイナリは既存の /excel-pdf/<filename> から取得します
+def pdfjs_view_cdn(filename):
+    # ヘッダーアイコン（任意）。static/icon.svg があれば使う
+    icon_url = None
+    icon_path = Path("static/icon.svg")
+    if icon_path.exists():
+        icon_url = url_for("static", filename="icon.svg")
     return render_template_string(
-        PDFJS_PAGE_MJS,
+        PDFJS_PAGE_CDN,
         filename=filename,
-        pdf_url=url_for('excel_pdf', filename=filename)
+        pdf_url=url_for('excel_pdf', filename=filename),
+        icon_url=icon_url
     )
 
 
+<a href="{{ url_for('pdfjs_view_cdn', filename=f) }}" target="_blank" rel="noopener">{{ f }}</a>
 
 ---------------------------------------------------------------------------------------------------------
 ---------------------------------------------------------------------------------------------------------
