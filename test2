@@ -1,4 +1,6 @@
+# --------------------------------------------------------------------------------------------------
 # excel_template_engine_anycol.py
+# --------------------------------------------------------------------------------------------------
 from openpyxl import load_workbook
 from copy import copy
 
@@ -7,7 +9,12 @@ END_MARK = "{{ EndFor }}"
 DATE_MARK = "{{ DATE_ROW }}"
 STATS_MARK = "{{ STATS }}"
 
+# コメント
 def _find_cell(ws, token, start_row=1, start_col=1):
+    """
+    シート内で token を含むセルを上から検索して (row, col) を返す。
+    見つからなければ (None, None) を返す（エラーにしない）。
+    """
     for r in range(start_row, ws.max_row + 1):
         for c in range(start_col if r == start_row else 1, ws.max_column + 1):
             v = ws.cell(r, c).value
@@ -15,17 +22,26 @@ def _find_cell(ws, token, start_row=1, start_col=1):
                 return r, c
     return None, None
 
+# コメント
 def _find_for_block(ws):
+    """
+    For/EndFor ブロックを検出して、((for_row, for_col), (end_row, end_col), template_row_list) を返す。
+    見つからなければ ((None,None),(None,None),[]) を返す（エラーにしない）。
+    """
     sr, sc = _find_cell(ws, FOR_MARK)
     if not sr:
-        raise ValueError("{{ For TagBlock }} が見つかりません")
+        return (None, None), (None, None), []
     er, ec = _find_cell(ws, END_MARK, start_row=sr)
     if not er:
-        raise ValueError("{{ EndFor }} が見つかりません")
+        return (sr, sc), (None, None), []
     template_rows = list(range(sr + 1, er))  # For〜EndFor の“間”
     return (sr, sc), (er, ec), template_rows
 
+# コメント
 def _clone_row(ws, src_row, dst_row):
+    """
+    src_row の見た目（値・書式）を保ったまま dst_row に行を挿入して複製する。
+    """
     ws.insert_rows(dst_row)
     for c in range(1, ws.max_column + 1):
         s = ws.cell(src_row, c)
@@ -37,62 +53,97 @@ def _clone_row(ws, src_row, dst_row):
         d.fill = copy(s.fill)
         d.alignment = copy(s.alignment)
 
+# コメント
 def _delete_rows(ws, start_row, end_row):
+    """
+    行範囲を削除する。start_row > end_row の場合は何もしない（エラーにしない）。
+    """
+    if not start_row or not end_row or start_row > end_row:
+        return
     for _ in range(end_row - start_row + 1):
         ws.delete_rows(start_row)
 
+# コメント
 def _replace_all_in_row(ws, row, placeholder, replacement):
+    """
+    指定行の全セル文字列から placeholder を replacement に置換。
+    文字列でないセルは無視。
+    """
+    if not row:
+        return
     for c in range(1, ws.max_column + 1):
         v = ws.cell(row, c).value
         if isinstance(v, str) and placeholder in v:
             ws.cell(row, c, v.replace(placeholder, replacement))
 
+# コメント
 def _row_find_token_cols(ws, row, token):
+    """
+    指定行の中で token を含むセルの列番号リストを返す。
+    見つからなければ空リスト。
+    """
     cols = []
+    if not row:
+        return cols
     for c in range(1, ws.max_column + 1):
         v = ws.cell(row, c).value
         if isinstance(v, str) and token in v:
             cols.append(c)
     return cols
 
+# コメント
 def _fill_right(ws, row, col_start, values):
+    """
+    (row, col_start) から右方向に values を順に書き込む。row/col が無効なら何もしない。
+    """
+    if not row or not col_start:
+        return
     for i, val in enumerate(values):
         ws.cell(row=row, column=col_start + i, value=val)
 
+# コメント
 def render_excel_with_dynamic_stats_anycol(
     template_path: str,
     out_path: str,
     calendar_days,     # List[date]
     blocks_data,       # List[{"LABEL":str,"STATS":[(key,disp)],"SERIES":{key:[...]}}]
 ):
+    """
+    任意列に置いたタグを検出し、For/EndFor ブロックを blocks_data で展開する。
+    - タグ（For/EndFor/DATE_ROW/STATS）が無くてもエラーにせず可能な範囲で処理する。
+    - DATE_ROW が無ければ日付行の横展開はスキップ。
+    - STATS が無ければ統計行の展開はスキップ。
+    - For/EndFor が無ければテンプレそのままを保存して終了。
+    """
     wb = load_workbook(template_path)
     ws = wb.active
 
+    # For ブロック検出（無ければそのまま保存して終了）
     (for_r, _), (end_r, _), tmpl_rows = _find_for_block(ws)
     if not tmpl_rows:
-        raise ValueError("For と EndFor の間にひな形行がありません")
+        wb.save(out_path)
+        return
 
-    # ひな形中の STATS 行（最初の1つ）と DATE 行（最初の1つ）
+    # ひな形中の STATS 行（最初の1つ）と DATE 行（最初の1つ）を探す
     stats_row_rel = None
     date_row_rel = None
     for idx, r in enumerate(tmpl_rows):
-        row_text = "".join(
-            str(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)
-            if ws.cell(r, c).value is not None
-        )
+        row_text = []
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if v is not None:
+                row_text.append(str(v))
+        row_text = "".join(row_text)
         if stats_row_rel is None and STATS_MARK in row_text:
             stats_row_rel = idx
         if date_row_rel is None and DATE_MARK in row_text:
             date_row_rel = idx
         if stats_row_rel is not None and date_row_rel is not None:
             break
-    if stats_row_rel is None:
-        raise ValueError("ひな形に {{ STATS }} 行がありません")
-    if date_row_rel is None:
-        raise ValueError("ひな形に {{ DATE_ROW }} 行がありません")
+    # なくても動作継続（後で分岐）
 
     insert_at = for_r
-    for block in blocks_data:
+    for block in blocks_data or []:
         # 1) ひな形を1セット差し込み
         for r in tmpl_rows:
             _clone_row(ws, r, insert_at + 1)
@@ -103,67 +154,80 @@ def render_excel_with_dynamic_stats_anycol(
         for r in new_rows:
             _replace_all_in_row(ws, r, "{{ LABEL }}", str(block.get("LABEL", "")))
 
-        # 3) DATE_ROW：そのセルの右隣から横展開
-        date_row = new_rows[date_row_rel]
-        date_cols = _row_find_token_cols(ws, date_row, DATE_MARK)
-        if not date_cols:
-            raise ValueError("DATE_ROW のセルが見つかりません")
-        dc = date_cols[0]
-        v = ws.cell(date_row, dc).value or ""
-        ws.cell(date_row, dc, v.replace(DATE_MARK, "").strip() or "日付:")
-        _fill_right(ws, date_row, dc + 1, [d.isoformat() for d in calendar_days])
+        # 3) DATE_ROW：見つかっていれば、そのセルの右隣から横展開
+        if date_row_rel is not None:
+            date_row = new_rows[date_row_rel]
+            date_cols = _row_find_token_cols(ws, date_row, DATE_MARK)
+            if date_cols:
+                dc = date_cols[0]
+                v = ws.cell(date_row, dc).value or ""
+                ws.cell(date_row, dc, (v.replace(DATE_MARK, "").strip() or "日付:"))
+                _fill_right(ws, date_row, dc + 1, [d.isoformat() for d in (calendar_days or [])])
 
-        # 4) STATS：トークンセル列を基準に行を増殖
-        stats_row = new_rows[stats_row_rel]
-        stats_cols = _row_find_token_cols(ws, stats_row, STATS_MARK)
-        if not stats_cols:
-            raise ValueError("STATS のセルが見つかりません")
-        sc = stats_cols[0]
+        # 4) STATS：見つかっていれば、トークンセル列を基準に行を増殖
+        if stats_row_rel is not None:
+            stats_row = new_rows[stats_row_rel]
+            stats_cols = _row_find_token_cols(ws, stats_row, STATS_MARK)
+            if stats_cols:
+                sc = stats_cols[0]
+                # 雛形 STATS 行のスタイルを保存
+                style_cache = []
+                for c in range(1, ws.max_column + 1):
+                    s = ws.cell(stats_row, c)
+                    style_cache.append((s.number_format, copy(s.font), copy(s.border), copy(s.fill), copy(s.alignment)))
+                # 雛形 STATS 行を削除 → 選択統計ぶん挿入
+                _delete_rows(ws, stats_row, stats_row)
+                cur = stats_row
+                for key, disp in (block.get("STATS") or []):
+                    series = (block.get("SERIES") or {}).get(key, [])
+                    ws.insert_rows(cur)
+                    # スタイル適用
+                    for c in range(1, ws.max_column + 1):
+                        cell = ws.cell(cur, c)
+                        nf, ft, bd, fl, al = style_cache[c-1]
+                        cell.number_format = nf
+                        cell.font = ft
+                        cell.border = bd
+                        cell.fill = fl
+                        cell.alignment = al
+                    # ラベル（トークンセル位置に出す）
+                    ws.cell(cur, sc, f"{disp} :")
+                    # 値を右へ
+                    _fill_right(ws, cur, sc + 1, series)
+                    cur += 1
+                # STATS が空なら何もしない
 
-        # 雛形 STATS 行のスタイルを保存
-        style_cache = []
-        for c in range(1, ws.max_column + 1):
-            s = ws.cell(stats_row, c)
-            style_cache.append((s.number_format, copy(s.font), copy(s.border), copy(s.fill), copy(s.alignment)))
-
-        # 雛形 STATS 行を削除 → 選択統計ぶん挿入
-        _delete_rows(ws, stats_row, stats_row)
-        cur = stats_row
-        for key, disp in (block.get("STATS") or []):
-            series = (block.get("SERIES") or {}).get(key, [])
-            ws.insert_rows(cur)
-            for c in range(1, ws.max_column + 1):
-                cell = ws.cell(cur, c)
-                nf, ft, bd, fl, al = style_cache[c-1]
-                cell.number_format = nf; cell.font = ft
-                cell.border = bd; cell.fill = fl; cell.alignment = al
-            ws.cell(cur, sc, f"{disp} :")
-            _fill_right(ws, cur, sc + 1, series)
-            cur += 1
-
-    # 5) 元の For〜EndFor を削除（位置ズレ防止のため再検出）
+    # 5) 元の For〜EndFor を削除（見つかれば削除。見つからなくてもエラーにしない）
     fr2, _ = _find_cell(ws, FOR_MARK)
     er2, _ = _find_cell(ws, END_MARK, start_row=fr2 or 1)
-    if fr2 and er2:
+    if fr2 and er2 and fr2 <= er2:
         _delete_rows(ws, fr2, er2)
 
     wb.save(out_path)
 
 
 # --------------------------------------------------------------------------------------------------
-# --------------------------------------------------------------------------------------------------
-# --------------------------------------------------------------------------------------------------
-
-
 # example.py
+# --------------------------------------------------------------------------------------------------
+
+
 import argparse, json
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from excel_template_engine_anycol import render_excel_with_dynamic_stats_anycol
 
+# コメント
 def build_calendar(from_date: str, to_date: str):
-    # from_date/to_date は YYYY-MM-DD（to は非含む）
-    f = datetime.fromisoformat(from_date).date()
-    t = datetime.fromisoformat(to_date).date()
+    """
+    YYYY-MM-DD 形式の from/to（toは非含む）から日付配列を作る。
+    不正な日付や未指定時は空配列を返す（エラーにしない）。
+    """
+    if not from_date or not to_date:
+        return []
+    try:
+        f = datetime.fromisoformat(from_date).date()
+        t = datetime.fromisoformat(to_date).date()
+    except Exception:
+        return []
     days = []
     cur = f
     while cur < t:
@@ -171,29 +235,44 @@ def build_calendar(from_date: str, to_date: str):
         cur += timedelta(days=1)
     return days
 
+# コメント
 def load_blocks(json_path: str):
+    """
+    blocks.json を読み込み、必要なキーをゆるく整形して返す。
+    形式:
+      [
+        {"LABEL":"TagA",
+         "STATS":[["Sum","合計"],["Avg","平均"]],
+         "SERIES":{"Sum":[...], "Avg":[...]}}
+      ]
+    足りないキーがあっても可能な範囲で解釈（エラーにしない）。
+    """
     with open(json_path, "r", encoding="utf-8") as f:
         obj = json.load(f)
-    # 期待する形式:
-    # [
-    #   {"LABEL":"TagA",
-    #    "STATS":[["Sum","合計"],["Avg","平均"]],
-    #    "SERIES":{"Sum":[...], "Avg":[...]}}
-    # ]
-    # ※ ["Sum","合計"] でも ("Sum","合計") でもOK
-    # 型整形（tuple化）
+
     blocks = []
-    for b in obj:
-        stats = [(s[0], s[1]) for s in b.get("STATS", [])]
+    for b in (obj or []):
+        label = b.get("LABEL", "")
+        raw_stats = b.get("STATS") or []
+        stats = []
+        for s in raw_stats:
+            try:
+                key, disp = s[0], s[1]
+            except Exception:
+                continue
+            stats.append((key, disp))
         blocks.append({
-            "LABEL": b["LABEL"],
+            "LABEL": label,
             "STATS": stats,
-            "SERIES": b.get("SERIES", {})
+            "SERIES": b.get("SERIES", {}) or {}
         })
     return blocks
 
+# コメント
 def demo_blocks():
-    # サンプル用（DBなしの動作確認）
+    """
+    デモ用のダミーデータを返す。テンプレ動作確認用。
+    """
     cal = build_calendar("2025-09-01", "2025-09-11")
     n = len(cal)
     return [
@@ -208,12 +287,20 @@ def demo_blocks():
         {
             "LABEL": "TagB",
             "STATS": [("Max","最大")],
-            "SERIES": {"Max": [20 + (i%3) for i in range(n)]}
+            "SERIES": {"Max": [20 + (i % 3) for i in range(n)]}
         }
     ], cal
 
+# コメント
 def main():
-    ap = argparse.ArgumentParser(description="Render Excel from template with dynamic stats.")
+    """
+    CLI 実行入口。テンプレとブロックデータを読み、Excel を生成する。
+    例：
+      python example.py --template template.xlsx --out report.xlsx
+      python example.py --template template.xlsx --out report.xlsx \
+        --from 2025-09-01 --to 2025-09-11 --blocks blocks.json
+    """
+    ap = argparse.ArgumentParser(description="Render Excel from template with dynamic stats (tolerant).")
     ap.add_argument("--template", "-t", default="template.xlsx", help="Path to template .xlsx")
     ap.add_argument("--out", "-o", default="report.xlsx", help="Path to output .xlsx")
     ap.add_argument("--from", dest="from_date", help="Start date YYYY-MM-DD (inclusive)")
@@ -223,11 +310,9 @@ def main():
 
     if args.blocks:
         blocks = load_blocks(args.blocks)
-        if not (args.from_date and args.to_date):
-            raise SystemExit("--from と --to を指定してください（blocks JSON を使う場合）")
         calendar_days = build_calendar(args.from_date, args.to_date)
     else:
-        # デモデータ
+        # デモデータ（--blocks未指定時）
         blocks, calendar_days = demo_blocks()
 
     render_excel_with_dynamic_stats_anycol(
@@ -238,6 +323,7 @@ def main():
     )
     print(f"✅ Wrote: {args.out}")
 
+# コメント
 if __name__ == "__main__":
     main()
 
