@@ -1,127 +1,166 @@
-import boto3
-import json
-from datetime import datetime, timedelta
-from botocore.signers import CloudFrontSigner
-import rsa
+# excel_template_engine_anycol.py
+from openpyxl import load_workbook
+from copy import copy
 
-class CloudFrontCookieGenerator:
-    def __init__(self, key_id, private_key_path):
-        self.key_id = key_id
-        with open(private_key_path, 'r') as key_file:
-            self.private_key = rsa.PrivateKey.load_pkcs1(key_file.read().encode())
-        
-    def rsa_signer(self, message):
-        return rsa.sign(message, self.private_key, 'SHA-1')
-    
-    def create_signed_cookies(self, resource_patterns, expire_time):
-        """
-        複数のリソースパターンに対応したCookieを生成
-        """
-        cloudfront_signer = CloudFrontSigner(self.key_id, self.rsa_signer)
-        
-        # Policyの作成（複数リソースに対応）
-        policy = {
-            "Statement": [
-                {
-                    "Resource": resource_patterns,  # リストで複数指定可能
-                    "Condition": {
-                        "DateLessThan": {
-                            "AWS:EpochTime": int(expire_time.timestamp())
-                        }
-                    }
-                }
-            ]
-        }
-        
-        policy_json = json.dumps(policy, separators=(',', ':'))
-        
-        # 署名付きCookieの生成
-        signed_cookies = cloudfront_signer.generate_presigned_url(
-            url='dummy',  # Cookieの場合は使用されない
-            policy=policy_json
-        )
-        
-        return {
-            'CloudFront-Policy': policy_json,
-            'CloudFront-Signature': signed_cookies['Signature'],
-            'CloudFront-Key-Pair-Id': self.key_id
-        }
+FOR_MARK = "{{ For TagBlock }}"
+END_MARK = "{{ EndFor }}"
+DATE_MARK = "{{ DATE_ROW }}"
+STATS_MARK = "{{ STATS }}"
+
+def _find_cell(ws, token, start_row=1, start_col=1):
+    for r in range(start_row, ws.max_row + 1):
+        for c in range(start_col if r == start_row else 1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and token in v:
+                return r, c
+    return None, None
+
+def _find_for_block(ws):
+    sr, sc = _find_cell(ws, FOR_MARK)
+    if not sr: raise ValueError("{{ For TagBlock }} が見つかりません")
+    er, ec = _find_cell(ws, END_MARK, start_row=sr)
+    if not er: raise ValueError("{{ EndFor }} が見つかりません")
+    # ひな形は For と EndFor の“間”の行
+    template_rows = list(range(sr + 1, er))
+    return (sr, sc), (er, ec), template_rows
+
+def _clone_row(ws, src_row, dst_row):
+    ws.insert_rows(dst_row)
+    for c in range(1, ws.max_column + 1):
+        s = ws.cell(src_row, c); d = ws.cell(dst_row, c)
+        d.value = s.value; d.number_format = s.number_format
+        d.font = copy(s.font); d.border = copy(s.border)
+        d.fill = copy(s.fill); d.alignment = copy(s.alignment)
+
+def _delete_rows(ws, start_row, end_row):
+    for _ in range(end_row - start_row + 1):
+        ws.delete_rows(start_row)
+
+def _replace_all_in_row(ws, row, placeholder, replacement):
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row, c).value
+        if isinstance(v, str) and placeholder in v:
+            ws.cell(row, c, v.replace(placeholder, replacement))
+
+def _row_find_token_cols(ws, row, token):
+    cols = []
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row, c).value
+        if isinstance(v, str) and token in v:
+            cols.append(c)
+    return cols
+
+def _fill_right(ws, row, col_start, values):
+    for i, val in enumerate(values):
+        ws.cell(row=row, column=col_start + i, value=val)
+
+def render_excel_with_dynamic_stats_anycol(
+    template_path: str,
+    out_path: str,
+    calendar_days,     # List[date]
+    blocks_data,       # List[{"LABEL":str,"STATS":[(key,disp)],"SERIES":{key:[...]}}]
+):
+    wb = load_workbook(template_path)
+    ws = wb.active
+
+    (for_r, _), (end_r, _), tmpl_rows = _find_for_block(ws)
+    if not tmpl_rows:
+        raise ValueError("For と EndFor の間にひな形行がありません")
+
+    # ひな形中の STATS 行（最初の1つ）と DATE 行（複数あっても最初の1つを採用）
+    stats_row_rel = None
+    date_row_rel = None
+    for idx, r in enumerate(tmpl_rows):
+        row_text = "".join([str(ws.cell(r, c).value) for c in range(1, ws.max_column + 1) if ws.cell(r,c).value])
+        if stats_row_rel is None and STATS_MARK in row_text:
+            stats_row_rel = idx
+        if date_row_rel is None and DATE_MARK in row_text:
+            date_row_rel = idx
+        if stats_row_rel is not None and date_row_rel is not None:
+            break
+    if stats_row_rel is None:
+        raise ValueError("ひな形に {{ STATS }} 行がありません")
+    if date_row_rel is None:
+        raise ValueError("ひな形に {{ DATE_ROW }} 行がありません")
+
+    insert_at = for_r
+    for block in blocks_data:
+        # 1) 雛形を1セット差し込む
+        for r in tmpl_rows:
+            _clone_row(ws, r, insert_at + 1)
+            insert_at += 1
+        new_rows = list(range(insert_at - len(tmpl_rows) + 1, insert_at + 1))
+
+        # 2) LABEL 置換（行内の全セルが対象）
+        for r in new_rows:
+            _replace_all_in_row(ws, r, "{{ LABEL }}", str(block.get("LABEL", "")))
+
+        # 3) DATE_ROW 行処理：トークンのあるセル位置から“右隣列”に横展開
+        date_row = new_rows[date_row_rel]
+        date_cols = _row_find_token_cols(ws, date_row, DATE_MARK)
+        if not date_cols:
+            raise ValueError("DATE_ROW のセルが見つかりません（雛形行内のどこかに {{ DATE_ROW }} を置いてください）")
+        dc = date_cols[0]  # 最初のセルを採用
+        v = ws.cell(date_row, dc).value
+        ws.cell(date_row, dc, v.replace(DATE_MARK, "").strip() or "日付:")
+        _fill_right(ws, date_row, dc + 1, [d.isoformat() for d in calendar_days])
+
+        # 4) STATS 行展開：トークンセルの列位置を基準にラベル＋横展開
+        stats_row = new_rows[stats_row_rel]
+        stats_cols = _row_find_token_cols(ws, stats_row, STATS_MARK)
+        if not stats_cols:
+            raise ValueError("STATS のセルが見つかりません（雛形行内のどこかに {{ STATS }} を置いてください）")
+        sc = stats_cols[0]
+
+        # 保存しておく：雛形 STATS 行のスタイル（全列分）
+        style_cache = []
+        for c in range(1, ws.max_column + 1):
+            s = ws.cell(stats_row, c)
+            style_cache.append((s.number_format, copy(s.font), copy(s.border), copy(s.fill), copy(s.alignment)))
+
+        # ひな形 STATS 行は削除し、この位置に選択された統計だけ行を差し込む
+        _delete_rows(ws, stats_row, stats_row)
+        cur = stats_row
+        for key, disp in (block.get("STATS") or []):
+            series = (block.get("SERIES") or {}).get(key, [])
+            ws.insert_rows(cur)
+            # スタイル適用
+            for c in range(1, ws.max_column + 1):
+                cell = ws.cell(cur, c)
+                nf, ft, bd, fl, al = style_cache[c-1]
+                cell.number_format = nf; cell.font = ft
+                cell.border = bd; cell.fill = fl; cell.alignment = al
+            # ラベル（トークンがあったセルに書く）
+            ws.cell(cur, sc, f"{disp} :")
+            # 値を右へ
+            _fill_right(ws, cur, sc + 1, series)
+            cur += 1
+        # STATS 未選択なら何も差し込まない
+
+    # 5) 元の For〜EndFor を削除（位置がズレている可能性があるので再検出して削除）
+    fr2, _, _ = _find_for_block(ws)  # 再検出
+    _delete_rows(ws, fr2[0], _find_cell(ws, END_MARK, start_row=fr2[0])[0])
+
+    wb.save(out_path)
 
 
-
-# Flask アプリケーションでの実装例
-from flask import Flask, make_response, request
-from datetime import datetime, timedelta
-
-app = Flask(__name__)
-
-@app.route('/authorize')
-def create_signed_cookies():
-    # 複数のリソースパターンを指定
-    resource_patterns = [
-        "https://your-distribution.cloudfront.net/videos/*",
-        "https://your-distribution.cloudfront.net/thumbnails/*",
-        "https://your-distribution.cloudfront.net/subtitles/*"
-    ]
-    
-    expire_time = datetime.utcnow() + timedelta(hours=24)
-    
-    cookie_generator = CloudFrontCookieGenerator(
-        key_id='YOUR_KEY_PAIR_ID',
-        private_key_path='path/to/private_key.pem'
-    )
-    
-    signed_cookies = cookie_generator.create_signed_cookies(
-        resource_patterns, expire_time
-    )
-    
-    response = make_response("認証成功")
-    
-    # Cookieを設定
-    for cookie_name, cookie_value in signed_cookies.items():
-        response.set_cookie(
-            cookie_name,
-            cookie_value,
-            domain='.your-domain.com',
-            secure=True,
-            httponly=True,
-            samesite='Strict'
-        )
-    
-    return response
+# --------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
 
 
-class SimplifiedCloudFrontSigner:
-    def __init__(self, key_pair_id, private_key_content):
-        self.key_pair_id = key_pair_id
-        self.private_key = rsa.PrivateKey.load_pkcs1(private_key_content.encode())
-    
-    def generate_cookies(self, urls, expires_in_hours=24):
-        expire_time = datetime.utcnow() + timedelta(hours=expires_in_hours)
-        
-        # Policy作成
-        policy = {
-            "Statement": [{
-                "Resource": urls,
-                "Condition": {
-                    "DateLessThan": {"AWS:EpochTime": int(expire_time.timestamp())}
-                }
-            }]
-        }
-        
-        policy_json = json.dumps(policy, separators=(',', ':'))
-        
-        # エンコードと署名
-        encoded_policy = base64.b64encode(policy_json.encode()).decode()
-        encoded_policy = encoded_policy.replace('+', '-').replace('=', '_').replace('/', '~')
-        
-        signature = rsa.sign(policy_json.encode(), self.private_key, 'SHA-1')
-        encoded_signature = base64.b64encode(signature).decode()
-        encoded_signature = encoded_signature.replace('+', '-').replace('=', '_').replace('/', '~')
-        
-        return {
-            'CloudFront-Policy': encoded_policy,
-            'CloudFront-Signature': encoded_signature,
-            'CloudFront-Key-Pair-Id': self.key_pair_id
-        }
+from datetime import date, timedelta
+from excel_template_engine_anycol import render_excel_with_dynamic_stats_anycol
+
+calendar_days = [date(2025,9,1) + timedelta(days=i) for i in range(10)]
+blocks_data = [
+    {"LABEL":"TagA",
+     "STATS":[("Sum","合計"),("Avg","平均")],
+     "SERIES":{"Sum":[100,120,110,130,140,160,150,170,165,180],
+               "Avg":[10.0,12.0,11.0,13.0,14.0,16.0,15.0,17.0,16.5,18.0]}},
+    {"LABEL":"TagB",
+     "STATS":[("Max","最大")],
+     "SERIES":{"Max":[20,21,19,23,22,24,25,26,24,27]}},
+]
+render_excel_with_dynamic_stats_anycol("template.xlsx","report.xlsx",calendar_days,blocks_data)
 
