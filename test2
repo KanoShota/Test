@@ -17,20 +17,25 @@ def _find_cell(ws, token, start_row=1, start_col=1):
 
 def _find_for_block(ws):
     sr, sc = _find_cell(ws, FOR_MARK)
-    if not sr: raise ValueError("{{ For TagBlock }} が見つかりません")
+    if not sr:
+        raise ValueError("{{ For TagBlock }} が見つかりません")
     er, ec = _find_cell(ws, END_MARK, start_row=sr)
-    if not er: raise ValueError("{{ EndFor }} が見つかりません")
-    # ひな形は For と EndFor の“間”の行
-    template_rows = list(range(sr + 1, er))
+    if not er:
+        raise ValueError("{{ EndFor }} が見つかりません")
+    template_rows = list(range(sr + 1, er))  # For〜EndFor の“間”
     return (sr, sc), (er, ec), template_rows
 
 def _clone_row(ws, src_row, dst_row):
     ws.insert_rows(dst_row)
     for c in range(1, ws.max_column + 1):
-        s = ws.cell(src_row, c); d = ws.cell(dst_row, c)
-        d.value = s.value; d.number_format = s.number_format
-        d.font = copy(s.font); d.border = copy(s.border)
-        d.fill = copy(s.fill); d.alignment = copy(s.alignment)
+        s = ws.cell(src_row, c)
+        d = ws.cell(dst_row, c)
+        d.value = s.value
+        d.number_format = s.number_format
+        d.font = copy(s.font)
+        d.border = copy(s.border)
+        d.fill = copy(s.fill)
+        d.alignment = copy(s.alignment)
 
 def _delete_rows(ws, start_row, end_row):
     for _ in range(end_row - start_row + 1):
@@ -67,11 +72,14 @@ def render_excel_with_dynamic_stats_anycol(
     if not tmpl_rows:
         raise ValueError("For と EndFor の間にひな形行がありません")
 
-    # ひな形中の STATS 行（最初の1つ）と DATE 行（複数あっても最初の1つを採用）
+    # ひな形中の STATS 行（最初の1つ）と DATE 行（最初の1つ）
     stats_row_rel = None
     date_row_rel = None
     for idx, r in enumerate(tmpl_rows):
-        row_text = "".join([str(ws.cell(r, c).value) for c in range(1, ws.max_column + 1) if ws.cell(r,c).value])
+        row_text = "".join(
+            str(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)
+            if ws.cell(r, c).value is not None
+        )
         if stats_row_rel is None and STATS_MARK in row_text:
             stats_row_rel = idx
         if date_row_rel is None and DATE_MARK in row_text:
@@ -85,61 +93,59 @@ def render_excel_with_dynamic_stats_anycol(
 
     insert_at = for_r
     for block in blocks_data:
-        # 1) 雛形を1セット差し込む
+        # 1) ひな形を1セット差し込み
         for r in tmpl_rows:
             _clone_row(ws, r, insert_at + 1)
             insert_at += 1
         new_rows = list(range(insert_at - len(tmpl_rows) + 1, insert_at + 1))
 
-        # 2) LABEL 置換（行内の全セルが対象）
+        # 2) LABEL 置換
         for r in new_rows:
             _replace_all_in_row(ws, r, "{{ LABEL }}", str(block.get("LABEL", "")))
 
-        # 3) DATE_ROW 行処理：トークンのあるセル位置から“右隣列”に横展開
+        # 3) DATE_ROW：そのセルの右隣から横展開
         date_row = new_rows[date_row_rel]
         date_cols = _row_find_token_cols(ws, date_row, DATE_MARK)
         if not date_cols:
-            raise ValueError("DATE_ROW のセルが見つかりません（雛形行内のどこかに {{ DATE_ROW }} を置いてください）")
-        dc = date_cols[0]  # 最初のセルを採用
-        v = ws.cell(date_row, dc).value
+            raise ValueError("DATE_ROW のセルが見つかりません")
+        dc = date_cols[0]
+        v = ws.cell(date_row, dc).value or ""
         ws.cell(date_row, dc, v.replace(DATE_MARK, "").strip() or "日付:")
         _fill_right(ws, date_row, dc + 1, [d.isoformat() for d in calendar_days])
 
-        # 4) STATS 行展開：トークンセルの列位置を基準にラベル＋横展開
+        # 4) STATS：トークンセル列を基準に行を増殖
         stats_row = new_rows[stats_row_rel]
         stats_cols = _row_find_token_cols(ws, stats_row, STATS_MARK)
         if not stats_cols:
-            raise ValueError("STATS のセルが見つかりません（雛形行内のどこかに {{ STATS }} を置いてください）")
+            raise ValueError("STATS のセルが見つかりません")
         sc = stats_cols[0]
 
-        # 保存しておく：雛形 STATS 行のスタイル（全列分）
+        # 雛形 STATS 行のスタイルを保存
         style_cache = []
         for c in range(1, ws.max_column + 1):
             s = ws.cell(stats_row, c)
             style_cache.append((s.number_format, copy(s.font), copy(s.border), copy(s.fill), copy(s.alignment)))
 
-        # ひな形 STATS 行は削除し、この位置に選択された統計だけ行を差し込む
+        # 雛形 STATS 行を削除 → 選択統計ぶん挿入
         _delete_rows(ws, stats_row, stats_row)
         cur = stats_row
         for key, disp in (block.get("STATS") or []):
             series = (block.get("SERIES") or {}).get(key, [])
             ws.insert_rows(cur)
-            # スタイル適用
             for c in range(1, ws.max_column + 1):
                 cell = ws.cell(cur, c)
                 nf, ft, bd, fl, al = style_cache[c-1]
                 cell.number_format = nf; cell.font = ft
                 cell.border = bd; cell.fill = fl; cell.alignment = al
-            # ラベル（トークンがあったセルに書く）
             ws.cell(cur, sc, f"{disp} :")
-            # 値を右へ
             _fill_right(ws, cur, sc + 1, series)
             cur += 1
-        # STATS 未選択なら何も差し込まない
 
-    # 5) 元の For〜EndFor を削除（位置がズレている可能性があるので再検出して削除）
-    fr2, _, _ = _find_for_block(ws)  # 再検出
-    _delete_rows(ws, fr2[0], _find_cell(ws, END_MARK, start_row=fr2[0])[0])
+    # 5) 元の For〜EndFor を削除（位置ズレ防止のため再検出）
+    fr2, _ = _find_cell(ws, FOR_MARK)
+    er2, _ = _find_cell(ws, END_MARK, start_row=fr2 or 1)
+    if fr2 and er2:
+        _delete_rows(ws, fr2, er2)
 
     wb.save(out_path)
 
@@ -149,18 +155,133 @@ def render_excel_with_dynamic_stats_anycol(
 # --------------------------------------------------------------------------------------------------
 
 
-from datetime import date, timedelta
+# example.py
+import argparse, json
+from datetime import date, datetime, timedelta
 from excel_template_engine_anycol import render_excel_with_dynamic_stats_anycol
 
-calendar_days = [date(2025,9,1) + timedelta(days=i) for i in range(10)]
-blocks_data = [
-    {"LABEL":"TagA",
-     "STATS":[("Sum","合計"),("Avg","平均")],
-     "SERIES":{"Sum":[100,120,110,130,140,160,150,170,165,180],
-               "Avg":[10.0,12.0,11.0,13.0,14.0,16.0,15.0,17.0,16.5,18.0]}},
-    {"LABEL":"TagB",
-     "STATS":[("Max","最大")],
-     "SERIES":{"Max":[20,21,19,23,22,24,25,26,24,27]}},
+def build_calendar(from_date: str, to_date: str):
+    # from_date/to_date は YYYY-MM-DD（to は非含む）
+    f = datetime.fromisoformat(from_date).date()
+    t = datetime.fromisoformat(to_date).date()
+    days = []
+    cur = f
+    while cur < t:
+        days.append(cur)
+        cur += timedelta(days=1)
+    return days
+
+def load_blocks(json_path: str):
+    with open(json_path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    # 期待する形式:
+    # [
+    #   {"LABEL":"TagA",
+    #    "STATS":[["Sum","合計"],["Avg","平均"]],
+    #    "SERIES":{"Sum":[...], "Avg":[...]}}
+    # ]
+    # ※ ["Sum","合計"] でも ("Sum","合計") でもOK
+    # 型整形（tuple化）
+    blocks = []
+    for b in obj:
+        stats = [(s[0], s[1]) for s in b.get("STATS", [])]
+        blocks.append({
+            "LABEL": b["LABEL"],
+            "STATS": stats,
+            "SERIES": b.get("SERIES", {})
+        })
+    return blocks
+
+def demo_blocks():
+    # サンプル用（DBなしの動作確認）
+    cal = build_calendar("2025-09-01", "2025-09-11")
+    n = len(cal)
+    return [
+        {
+            "LABEL": "TagA",
+            "STATS": [("Sum","合計"), ("Avg","平均")],
+            "SERIES": {
+                "Sum": [100 + i*5 for i in range(n)],
+                "Avg": [10 + i*0.5 for i in range(n)],
+            }
+        },
+        {
+            "LABEL": "TagB",
+            "STATS": [("Max","最大")],
+            "SERIES": {"Max": [20 + (i%3) for i in range(n)]}
+        }
+    ], cal
+
+def main():
+    ap = argparse.ArgumentParser(description="Render Excel from template with dynamic stats.")
+    ap.add_argument("--template", "-t", default="template.xlsx", help="Path to template .xlsx")
+    ap.add_argument("--out", "-o", default="report.xlsx", help="Path to output .xlsx")
+    ap.add_argument("--from", dest="from_date", help="Start date YYYY-MM-DD (inclusive)")
+    ap.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD (exclusive)")
+    ap.add_argument("--blocks", "-b", help="Path to blocks JSON file")
+    args = ap.parse_args()
+
+    if args.blocks:
+        blocks = load_blocks(args.blocks)
+        if not (args.from_date and args.to_date):
+            raise SystemExit("--from と --to を指定してください（blocks JSON を使う場合）")
+        calendar_days = build_calendar(args.from_date, args.to_date)
+    else:
+        # デモデータ
+        blocks, calendar_days = demo_blocks()
+
+    render_excel_with_dynamic_stats_anycol(
+        template_path=args.template,
+        out_path=args.out,
+        calendar_days=calendar_days,
+        blocks_data=blocks
+    )
+    print(f"✅ Wrote: {args.out}")
+
+if __name__ == "__main__":
+    main()
+
+
+# --------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+
+{{ For TagBlock }}
+項目: {{ LABEL }}
+日付: {{ DATE_ROW }}
+{{ STATS }}
+{{ EndFor }}
+
+
+python example.py --template template.xlsx --out report.xlsx
+
+
+# --------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------------------
+
+blocks.json
+[
+  {
+    "LABEL": "TagA",
+    "STATS": [["Sum","合計"], ["Avg","平均"]],
+    "SERIES": {
+      "Sum": [100,120,110,130,140,160,150,170,165,180],
+      "Avg": [10.0,12.0,11.0,13.0,14.0,16.0,15.0,17.0,16.5,18.0]
+    }
+  },
+  {
+    "LABEL": "TagB",
+    "STATS": [["Max","最大"]],
+    "SERIES": { "Max": [20,21,19,23,22,24,25,26,24,27] }
+  }
 ]
-render_excel_with_dynamic_stats_anycol("template.xlsx","report.xlsx",calendar_days,blocks_data)
+
+
+ダミーを使って実行する例
+python example.py \
+  --template template.xlsx \
+  --out report.xlsx \
+  --from 2025-09-01 --to 2025-09-11 \
+  --blocks blocks.json
 
