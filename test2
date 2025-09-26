@@ -1,47 +1,57 @@
 # --------------------------------------------------------------------------------------------------
 # excel_template_engine_anycol.py
 # --------------------------------------------------------------------------------------------------
+# excel_template_engine_anycol.py
+import re
 from openpyxl import load_workbook
 from copy import copy
 
-FOR_MARK = "{{ For TagBlock }}"
-END_MARK = "{{ EndFor }}"
-DATE_MARK = "{{ DATE_ROW }}"
-STATS_MARK = "{{ STATS }}"
+# ゆるいマッチ（空白の有無を許容）
+FOR_PAT   = re.compile(r"\{\{\s*For\s+TagBlock\s*\}\}")
+END_PAT   = re.compile(r"\{\{\s*EndFor\s*\}\}")
+DATE_PAT  = re.compile(r"\{\{\s*DATE_ROW\s*\}\}")
+STATS_PAT = re.compile(r"\{\{\s*STATS\s*\}\}")
+LABEL_PAT = re.compile(r"\{\{\s*LABEL\s*\}\}")
 
 # コメント
-def _find_cell(ws, token, start_row=1, start_col=1):
-    """
-    シート内で token を含むセルを上から検索して (row, col) を返す。
-    見つからなければ (None, None) を返す（エラーにしない）。
-    """
+def _cell_has_token(value, pattern: re.Pattern) -> bool:
+    """セル文字列 value が pattern にヒットするか（非文字列はFalse）。"""
+    return isinstance(value, str) and bool(pattern.search(value))
+
+# コメント
+def _cell_replace_token(text: str, pattern: re.Pattern, replacement: str) -> str:
+    """セル文字列内のトークン（pattern）を replacement に1回だけ置換。非文字列はそのまま。"""
+    if not isinstance(text, str):
+        return text
+    return pattern.sub(replacement, text, count=1)
+
+# コメント
+def _find_cell(ws, pattern: re.Pattern, start_row=1, start_col=1):
+    """シート内で最初に pattern にヒットするセル (row, col) を返す。無ければ (None, None)。"""
     for r in range(start_row, ws.max_row + 1):
         for c in range(start_col if r == start_row else 1, ws.max_column + 1):
-            v = ws.cell(r, c).value
-            if isinstance(v, str) and token in v:
+            if _cell_has_token(ws.cell(r, c).value, pattern):
                 return r, c
     return None, None
 
 # コメント
 def _find_for_block(ws):
     """
-    For/EndFor ブロックを検出して、((for_row, for_col), (end_row, end_col), template_row_list) を返す。
-    見つからなければ ((None,None),(None,None),[]) を返す（エラーにしない）。
+    For/EndFor ブロックの開始・終了セルと、間の行番号リストを返す。
+    見つからなければ ((None,None),(None,None),[])。
     """
-    sr, sc = _find_cell(ws, FOR_MARK)
+    sr, sc = _find_cell(ws, FOR_PAT)
     if not sr:
         return (None, None), (None, None), []
-    er, ec = _find_cell(ws, END_MARK, start_row=sr)
+    er, ec = _find_cell(ws, END_PAT, start_row=sr)
     if not er:
         return (sr, sc), (None, None), []
-    template_rows = list(range(sr + 1, er))  # For〜EndFor の“間”
+    template_rows = list(range(sr + 1, er))
     return (sr, sc), (er, ec), template_rows
 
 # コメント
 def _clone_row(ws, src_row, dst_row):
-    """
-    src_row の見た目（値・書式）を保ったまま dst_row に行を挿入して複製する。
-    """
+    """src_row を丸ごと複製して dst_row に挿入（スタイルもコピー）。"""
     ws.insert_rows(dst_row)
     for c in range(1, ws.max_column + 1):
         s = ws.cell(src_row, c)
@@ -55,47 +65,36 @@ def _clone_row(ws, src_row, dst_row):
 
 # コメント
 def _delete_rows(ws, start_row, end_row):
-    """
-    行範囲を削除する。start_row > end_row の場合は何もしない（エラーにしない）。
-    """
+    """行範囲を削除。無効範囲は無視（エラーにしない）。"""
     if not start_row or not end_row or start_row > end_row:
         return
     for _ in range(end_row - start_row + 1):
         ws.delete_rows(start_row)
 
 # コメント
-def _replace_all_in_row(ws, row, placeholder, replacement):
-    """
-    指定行の全セル文字列から placeholder を replacement に置換。
-    文字列でないセルは無視。
-    """
+def _replace_all_in_row(ws, row, pattern: re.Pattern, replacement: str):
+    """指定行の全セルで pattern に一致する箇所を replacement に置換。"""
     if not row:
         return
     for c in range(1, ws.max_column + 1):
         v = ws.cell(row, c).value
-        if isinstance(v, str) and placeholder in v:
-            ws.cell(row, c, v.replace(placeholder, replacement))
+        if isinstance(v, str) and pattern.search(v):
+            ws.cell(row, c, pattern.sub(replacement, v))
 
 # コメント
-def _row_find_token_cols(ws, row, token):
-    """
-    指定行の中で token を含むセルの列番号リストを返す。
-    見つからなければ空リスト。
-    """
+def _row_find_token_cells(ws, row, pattern: re.Pattern):
+    """指定 row の中で pattern にマッチするセル列番号リスト。"""
     cols = []
     if not row:
         return cols
     for c in range(1, ws.max_column + 1):
-        v = ws.cell(row, c).value
-        if isinstance(v, str) and token in v:
+        if _cell_has_token(ws.cell(row, c).value, pattern):
             cols.append(c)
     return cols
 
 # コメント
 def _fill_right(ws, row, col_start, values):
-    """
-    (row, col_start) から右方向に values を順に書き込む。row/col が無効なら何もしない。
-    """
+    """(row, col_start) から右方向へ values を順に書き込む。"""
     if not row or not col_start:
         return
     for i, val in enumerate(values):
@@ -107,103 +106,105 @@ def render_excel_with_dynamic_stats_anycol(
     out_path: str,
     calendar_days,     # List[date]
     blocks_data,       # List[{"LABEL":str,"STATS":[(key,disp)],"SERIES":{key:[...]}}]
+    remove_template_if_no_blocks: bool = False,  # 展開0件のとき For〜EndFor を残す（既定）
 ):
     """
-    任意列に置いたタグを検出し、For/EndFor ブロックを blocks_data で展開する。
-    - タグ（For/EndFor/DATE_ROW/STATS）が無くてもエラーにせず可能な範囲で処理する。
-    - DATE_ROW が無ければ日付行の横展開はスキップ。
-    - STATS が無ければ統計行の展開はスキップ。
-    - For/EndFor が無ければテンプレそのままを保存して終了。
+    任意セルのタグを検出して For ブロックを展開する。
+    - タグの空白ゆらぎを許容（{{For TagBlock}}, {{ For  TagBlock }} 等）
+    - 1件以上の展開が成功したときだけ For〜EndFor を削除
+    - 展開0件 or タグ欠落時はテンプレを維持（削除しない）
     """
     wb = load_workbook(template_path)
     ws = wb.active
 
-    # For ブロック検出（無ければそのまま保存して終了）
     (for_r, _), (end_r, _), tmpl_rows = _find_for_block(ws)
     if not tmpl_rows:
+        # ブロックが無いなら何もせず保存
         wb.save(out_path)
         return
 
-    # ひな形中の STATS 行（最初の1つ）と DATE 行（最初の1つ）を探す
+    # ひな形内の STATS 行／DATE 行（最初に見つかったもの）
     stats_row_rel = None
-    date_row_rel = None
+    date_row_rel  = None
     for idx, r in enumerate(tmpl_rows):
-        row_text = []
+        # 行文字列を生成（全セル連結）
+        buf = []
         for c in range(1, ws.max_column + 1):
             v = ws.cell(r, c).value
             if v is not None:
-                row_text.append(str(v))
-        row_text = "".join(row_text)
-        if stats_row_rel is None and STATS_MARK in row_text:
+                buf.append(str(v))
+        row_text = "".join(buf)
+        if stats_row_rel is None and STATS_PAT.search(row_text):
             stats_row_rel = idx
-        if date_row_rel is None and DATE_MARK in row_text:
+        if date_row_rel is None and DATE_PAT.search(row_text):
             date_row_rel = idx
         if stats_row_rel is not None and date_row_rel is not None:
             break
-    # なくても動作継続（後で分岐）
 
     insert_at = for_r
-    for block in blocks_data or []:
-        # 1) ひな形を1セット差し込み
+    expanded_blocks = 0
+
+    for block in (blocks_data or []):
+        # 1) ひな形を1セット複製挿入
         for r in tmpl_rows:
             _clone_row(ws, r, insert_at + 1)
             insert_at += 1
         new_rows = list(range(insert_at - len(tmpl_rows) + 1, insert_at + 1))
 
-        # 2) LABEL 置換
+        # 2) LABEL 置換（行内の全セル）
         for r in new_rows:
-            _replace_all_in_row(ws, r, "{{ LABEL }}", str(block.get("LABEL", "")))
+            _replace_all_in_row(ws, r, LABEL_PAT, str(block.get("LABEL", "")))
 
         # 3) DATE_ROW：見つかっていれば、そのセルの右隣から横展開
         if date_row_rel is not None:
             date_row = new_rows[date_row_rel]
-            date_cols = _row_find_token_cols(ws, date_row, DATE_MARK)
+            date_cols = _row_find_token_cells(ws, date_row, DATE_PAT)
             if date_cols:
                 dc = date_cols[0]
-                v = ws.cell(date_row, dc).value or ""
-                ws.cell(date_row, dc, (v.replace(DATE_MARK, "").strip() or "日付:"))
+                val = ws.cell(date_row, dc).value or ""
+                ws.cell(date_row, dc, _cell_replace_token(val, DATE_PAT, "").strip() or "日付:")
                 _fill_right(ws, date_row, dc + 1, [d.isoformat() for d in (calendar_days or [])])
 
-        # 4) STATS：見つかっていれば、トークンセル列を基準に行を増殖
+        # 4) STATS：見つかっていれば、テンプレ1行を選択統計の行数に展開
+        did_stats = False
         if stats_row_rel is not None:
             stats_row = new_rows[stats_row_rel]
-            stats_cols = _row_find_token_cols(ws, stats_row, STATS_MARK)
+            stats_cols = _row_find_token_cells(ws, stats_row, STATS_PAT)
             if stats_cols:
                 sc = stats_cols[0]
-                # 雛形 STATS 行のスタイルを保存
+                # 雛形 STATS 行のスタイルを保持
                 style_cache = []
                 for c in range(1, ws.max_column + 1):
                     s = ws.cell(stats_row, c)
                     style_cache.append((s.number_format, copy(s.font), copy(s.border), copy(s.fill), copy(s.alignment)))
-                # 雛形 STATS 行を削除 → 選択統計ぶん挿入
+                # 雛形 STATS 行を消して、選択分だけ差し込む
                 _delete_rows(ws, stats_row, stats_row)
                 cur = stats_row
                 for key, disp in (block.get("STATS") or []):
                     series = (block.get("SERIES") or {}).get(key, [])
                     ws.insert_rows(cur)
-                    # スタイル適用
                     for c in range(1, ws.max_column + 1):
                         cell = ws.cell(cur, c)
                         nf, ft, bd, fl, al = style_cache[c-1]
-                        cell.number_format = nf
-                        cell.font = ft
-                        cell.border = bd
-                        cell.fill = fl
-                        cell.alignment = al
-                    # ラベル（トークンセル位置に出す）
+                        cell.number_format = nf; cell.font = ft
+                        cell.border = bd; cell.fill = fl; cell.alignment = al
                     ws.cell(cur, sc, f"{disp} :")
-                    # 値を右へ
                     _fill_right(ws, cur, sc + 1, series)
                     cur += 1
-                # STATS が空なら何もしない
+                    did_stats = True
 
-    # 5) 元の For〜EndFor を削除（見つかれば削除。見つからなくてもエラーにしない）
-    fr2, _ = _find_cell(ws, FOR_MARK)
-    er2, _ = _find_cell(ws, END_MARK, start_row=fr2 or 1)
-    if fr2 and er2 and fr2 <= er2:
-        _delete_rows(ws, fr2, er2)
+        if did_stats or date_row_rel is not None or LABEL_PAT:
+            expanded_blocks += 1
+
+    # 5) For〜EndFor を削除：展開が1件以上あった場合のみ
+    if expanded_blocks > 0 or remove_template_if_no_blocks:
+        fr2, _ = _find_cell(ws, FOR_PAT)
+        er2, _ = _find_cell(ws, END_PAT, start_row=fr2 or 1)
+        if fr2 and er2 and fr2 <= er2:
+            _delete_rows(ws, fr2, er2)
 
     wb.save(out_path)
+
 
 
 # --------------------------------------------------------------------------------------------------
