@@ -12,6 +12,11 @@ video::-webkit-media-controls-volume-control-hover-background {
   pointer-events: none !important;
 }
 
+/* Edge/Chrome/Safari(Chromium系)のPiP切替ボタンを非表示 */
+video::-webkit-media-controls-picture-in-picture-button {
+  display: none !important;
+}
+
 /* Firefox */
 video::-moz-media-controls {
   display: none !important;
