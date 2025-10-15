@@ -1,10 +1,20 @@
 /* Chrome, Edge, Safari (WebKit系) */
+video::-webkit-media-controls-mute-button,
 video::-webkit-media-controls-volume-slider,
-video::-webkit-media-controls-mute-button {
+video::-webkit-media-controls-volume-control-container,
+video::-webkit-media-controls-volume-control-hover-background {
   display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  width: 0 !important;
+  height: 0 !important;
+  overflow: hidden !important;
+  pointer-events: none !important;
 }
 
 /* Firefox */
 video::-moz-media-controls {
   display: none !important;
+  visibility: hidden !important;
 }
+
