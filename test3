@@ -46,6 +46,7 @@ python3.13 --version
 python3.10 --version
 # => Python 3.10.x
 
+# レイヤーの作り方
 mkdir ~/lambda_numpy_py312 && cd ~/lambda_numpy_py312
 mkdir python
 python3.12 -m venv venv
@@ -53,6 +54,7 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install --only-binary=:all: --target=python numpy
 find python -type d -name "__pycache__" -exec rm -rf {} +
+find python -name "*.pyc" -delete
 zip -r layer.zip python
 
 
