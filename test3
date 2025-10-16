@@ -43,21 +43,16 @@ sudo make altinstall
 python3.13 --version
 # => Python 3.13.0
 
-
-mkdir ~/lambda_numpy_layer
-cd ~/lambda_numpy_layer
-mkdir python
-
-source path/to/venv/bin/activate
-pip install --upgrade pip
-pip install --target=python numpy
-
-find python -type d -name "__pycache__" -exec rm -rf {} +
-find python -name "*.pyc" -delete
-
-zip -r layer.zip python
-
-
 python3.10 --version
 # => Python 3.10.x
+
+mkdir ~/lambda_numpy_py312 && cd ~/lambda_numpy_py312
+mkdir python
+python3.12 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install --only-binary=:all: --target=python numpy
+find python -type d -name "__pycache__" -exec rm -rf {} +
+zip -r layer.zip python
+
 
