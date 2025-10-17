@@ -1,27 +1,13 @@
-/* Chrome, Edge, Safari (WebKit系) */
-video::-webkit-media-controls-mute-button,
-video::-webkit-media-controls-volume-slider,
-video::-webkit-media-controls-volume-control-container,
-video::-webkit-media-controls-volume-control-hover-background {
-  display: none !important;
-  visibility: hidden !important;
-  opacity: 0 !important;
-  width: 0 !important;
-  height: 0 !important;
-  overflow: hidden !important;
-  pointer-events: none !important;
-}
+// ピクチャーインピクチャーを閉じる
+document.getElementById('closeBtn').addEventListener('click', async () => {
+  if (document.pictureInPictureElement) {
+    await document.exitPictureInPicture();
+  }
+  video.pause();
+  video.remove();
+});
 
-/* Edge/Chrome/Safari(Chromium系)のPiP切替ボタンを非表示 */
-video::-webkit-media-controls-picture-in-picture-button {
-  display: none !important;
-}
 
-/* Firefox */
-video::-moz-media-controls {
-  display: none !important;
-  visibility: hidden !important;
-}
 
 // 必要な依存関係をインストール
 sudo apt update
