@@ -44,3 +44,36 @@ find python -name "*.pyc" -delete
 zip -r layer.zip python
 
 
+
+
+from flask import Flask, request, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
+app = Flask(__name__)
+# LB を 1 段だけ通る前提。段数に合わせて x_* を調整
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+def detect_path(req):
+    """
+    入口の Host/Port/Proto を見て経路を判別
+    """
+    host = req.host              # 例) "app.example.com" / "ap-internal:9443"
+    scheme = req.scheme          # 例) "https"
+    url_root = req.url_root      # 例) "https://app.example.com/" / "https://ap-internal:9443/"
+    # 判別ロジック（必要に応じて厳密化）
+    if host == "app.example.com":
+        return "lb", scheme, host, url_root
+    if host == "ap-internal:9443" or host.startswith("ap-internal"):
+        return "bastion", scheme, host, url_root
+    # 予備：ポートで見る
+    if host.endswith(":9443"):
+        return "bastion", scheme, host, url_root
+    return "unknown", scheme, host, url_root
+@app.route("/whoami")
+def whoami():
+    kind, scheme, host, url_root = detect_path(request)
+    return jsonify({
+        "path": kind,               # "lb" / "bastion" / "unknown"
+        "scheme": scheme,
+        "host": host,
+        "url_root": url_root,
+        "full_url": request.url,
+    })
