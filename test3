@@ -77,3 +77,37 @@ def whoami():
         "url_root": url_root,
         "full_url": request.url,
     })
+
+
+
+
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+@app.route("/whoami")
+def whoami():
+    data = {
+        "peer_ip": request.environ.get("REMOTE_ADDR"),      # 直近で接続してきた相手のIP
+        "host": request.headers.get("Host"),
+        "xfh": request.headers.get("X-Forwarded-Host"),
+        "xfp": request.headers.get("X-Forwarded-Proto"),
+        "xfport": request.headers.get("X-Forwarded-Port"),
+        "xff": request.headers.get("X-Forwarded-For"),
+        "url_root": request.url_root,
+        "full_url": request.url,
+    }
+    return jsonify(data)
+
+
+
+
+
+12:02
+@app.route("/whoami")
+def whoami():
+    return {
+        "peer_ip": request.remote_addr,              # Flaskから見た直近接続元IP
+        "host": request.headers.get("Host"),         # ブラウザが指定したHostヘッダ
+        "xff": request.headers.get("X-Forwarded-For"),
+        "url_root": request.url_root,
+        "full_url": request.url
+    }
